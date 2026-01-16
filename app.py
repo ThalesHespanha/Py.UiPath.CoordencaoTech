@@ -276,31 +276,70 @@ def section_git_operations(config: dict):
                 # Display individual projects with update buttons
                 for project in projects:
                     with st.container():
-                        cols = st.columns([0.5, 0.1, 0.4])
+                        cols = st.columns([0.35, 0.08, 0.57])
                         
                         with cols[0]:
                             st.markdown(f"**📁 {project['name']}**")
-                            st.caption(f"v{project['version']} | {project['path']}")
+                            st.caption(f"v{project['version']}")
                         
                         with cols[1]:
                             # Check if repo has changes
                             try:
                                 repo = Repo(project['path'])
-                                if repo.is_dirty():
+                                is_dirty = repo.is_dirty(untracked_files=True)
+                                if is_dirty:
                                     st.warning("⚠️")
                                 else:
                                     st.success("✓")
                             except Exception:
                                 st.error("❌")
+                                is_dirty = False
                         
                         with cols[2]:
-                            if st.button("⬇️ Pull", key=f"pull_{project['name']}"):
-                                with st.spinner(f"Atualizando {project['name']}..."):
-                                    success, msg = git_pull_project(project['path'], config.get("github_token"))
-                                    if success:
-                                        st.success(f"✅ {msg}")
-                                    else:
-                                        st.error(f"❌ {msg}")
+                            btn_cols = st.columns(3)
+                            
+                            # Pull button
+                            with btn_cols[0]:
+                                if st.button("⬇️ Pull", key=f"pull_{project['name']}"):
+                                    with st.spinner("Pulling..."):
+                                        success, msg = git_pull_project(project['path'], config.get("github_token"))
+                                        if success:
+                                            st.toast(f"✅ {msg}")
+                                        else:
+                                            st.error(f"❌ {msg}")
+                            
+                            # Push button (with commit message popup)
+                            with btn_cols[1]:
+                                with st.popover("⬆️ Push"):
+                                    st.markdown("**Commit & Push**")
+                                    commit_msg = st.text_area(
+                                        "Mensagem do Commit",
+                                        placeholder="Descreva as alterações...",
+                                        key=f"commit_msg_{project['name']}",
+                                        height=80
+                                    )
+                                    if st.button("🚀 Enviar", key=f"push_btn_{project['name']}", type="primary"):
+                                        if commit_msg.strip():
+                                            success, msg = git_commit_push(project['path'], commit_msg, config.get("github_token"))
+                                            if success:
+                                                st.success(f"✅ {msg}")
+                                            else:
+                                                st.error(f"❌ {msg}")
+                                        else:
+                                            st.warning("⚠️ Digite uma mensagem de commit")
+                            
+                            # Undo button
+                            with btn_cols[2]:
+                                with st.popover("↩️ Undo"):
+                                    st.markdown("**⚠️ Descartar Mudanças**")
+                                    st.caption("Isso vai desfazer TODAS as alterações locais não commitadas.")
+                                    if st.button("🗑️ Confirmar Undo", key=f"undo_btn_{project['name']}", type="primary"):
+                                        success, msg = git_undo_changes(project['path'])
+                                        if success:
+                                            st.success(f"✅ {msg}")
+                                            st.rerun()
+                                        else:
+                                            st.error(f"❌ {msg}")
                         
                         st.markdown("---")
 
@@ -409,6 +448,75 @@ def git_pull_project(project_path: str, github_token: str = None) -> tuple:
                 origin.set_url(original_url)
         
         return True, message
+        
+    except Exception as e:
+        return False, str(e)
+
+
+def git_commit_push(project_path: str, commit_message: str, github_token: str = None) -> tuple:
+    """
+    Perform git add, commit, and push on a project.
+    Returns (success: bool, message: str)
+    """
+    try:
+        repo = Repo(project_path)
+        
+        # Check if there are any changes to commit
+        if not repo.is_dirty(untracked_files=True):
+            return False, "Não há mudanças para commitar."
+        
+        # Get current branch
+        current_branch = repo.active_branch.name
+        
+        # Stage all changes (git add .)
+        repo.git.add('--all')
+        
+        # Commit
+        repo.index.commit(commit_message)
+        
+        # Configure credentials and push
+        origin = repo.remotes.origin
+        original_url = origin.url
+        
+        # Inject token for private repos
+        if github_token and "https://" in original_url and "@" not in original_url:
+            auth_url = original_url.replace("https://", f"https://{github_token}@")
+            origin.set_url(auth_url)
+        
+        try:
+            # Push
+            origin.push(current_branch)
+            message = f"Commit e push realizados no branch '{current_branch}'"
+        finally:
+            # Restore original URL (don't leave token in config)
+            if github_token and "https://" in original_url:
+                origin.set_url(original_url)
+        
+        return True, message
+        
+    except Exception as e:
+        return False, str(e)
+
+
+def git_undo_changes(project_path: str) -> tuple:
+    """
+    Discard all local uncommitted changes (git checkout . and clean untracked).
+    Returns (success: bool, message: str)
+    """
+    try:
+        repo = Repo(project_path)
+        
+        # Check if there are any changes to undo
+        if not repo.is_dirty(untracked_files=True):
+            return False, "Não há mudanças para desfazer."
+        
+        # Discard all tracked file changes (git checkout .)
+        repo.git.checkout('--', '.')
+        
+        # Remove untracked files (git clean -fd)
+        repo.git.clean('-fd')
+        
+        return True, "Todas as mudanças locais foram descartadas."
         
     except Exception as e:
         return False, str(e)
