@@ -4,24 +4,25 @@ UiPath Team Coordinator
 Painel de Controle para gerenciar repositórios Git, Dependências e Deploy de automações UiPath.
 
 Author: DevOps Engineer
-Version: 1.0.0
+Version: 2.0.0 (Modularized)
 """
 
 import os
-import re
-import shutil
-import subprocess
 import tempfile
-from pathlib import Path
-from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional
 
 import streamlit as st
-import requests
 from dotenv import load_dotenv
-from git import Repo, GitCommandError
-from github import Github, GithubException
 
+# Services
+from services.project_scanner import scan_local_projects
+from services.github_service import GithubService
+from services.orchestrator import OrchestratorService
+from services.package_manager import PackageManager
+
+# Utils
+from utils.version import increment_version
+from utils.git_helpers import detect_remote_info
 
 # =============================================
 # CONFIGURATION & INITIALIZATION
@@ -64,39 +65,25 @@ st.markdown("""
         color: white;
         margin: 0.5rem 0;
     }
-    .error-highlight {
-        background-color: #ffebee;
-        border-left: 4px solid #f44336;
-        padding: 1rem;
-        margin: 1rem 0;
-        border-radius: 4px;
-    }
-    .success-highlight {
-        background-color: #e8f5e9;
-        border-left: 4px solid #4caf50;
-        padding: 1rem;
-        margin: 1rem 0;
-        border-radius: 4px;
-    }
-    .warning-highlight {
-        background-color: #fff3e0;
-        border-left: 4px solid #ff9800;
-        padding: 1rem;
-        margin: 1rem 0;
-        border-radius: 4px;
-    }
-    .pr-card {
-        background: white;
-        border: 1px solid #e0e0e0;
+    .success-msg { color: #4caf50; font-weight: bold; }
+    .error-msg { color: #f44336; font-weight: bold; }
+    
+    /* Project Card Style */
+    .project-card {
+        border: 1px solid #ddd;
         border-radius: 8px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        padding: 15px;
+        margin-bottom: 10px;
+        background-color: #f8f9fa;
     }
-    .metric-container {
-        display: flex;
-        justify-content: space-around;
-        flex-wrap: wrap;
+    .project-title {
+        font-size: 1.1em;
+        font-weight: bold;
+        color: #333;
+    }
+    .project-meta {
+        font-size: 0.9em;
+        color: #666;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -110,12 +97,14 @@ def get_env_config() -> dict:
     """Load and return environment configuration."""
     return {
         "github_token": os.getenv("GITHUB_TOKEN", ""),
+        "github_org": os.getenv("GITHUB_ORG", ""),
+        "github_team": os.getenv("GITHUB_TEAM", ""),
         "orch_url": os.getenv("ORCH_URL", "https://cloud.uipath.com"),
         "orch_org": os.getenv("ORCH_ORG_NAME", ""),
         "orch_tenant": os.getenv("ORCH_TENANT_NAME", ""),
         "orch_client_id": os.getenv("ORCH_CLIENT_ID", ""),
         "orch_client_secret": os.getenv("ORCH_CLIENT_SECRET", ""),
-        "orch_scope": os.getenv("ORCH_SCOPE", "OR.Folders OR.Assets OR.Jobs OR.Execution"),
+        "orch_scope": os.getenv("ORCH_SCOPE", "OR.Default"),
         "custom_nuget_feed": os.getenv("CUSTOM_NUGET_FEED", ""),
         "default_clone_dir": os.getenv("DEFAULT_CLONE_DIR", "C:\\UiPath\\Repos"),
         "default_output_dir": os.getenv("DEFAULT_OUTPUT_DIR", "C:\\UiPath\\Packages"),
@@ -132,320 +121,6 @@ def check_credentials(config: dict) -> dict:
         "Orchestrator Client ID": bool(config["orch_client_id"]),
         "Orchestrator Client Secret": bool(config["orch_client_secret"]),
     }
-
-
-# =============================================
-# ORCHESTRATOR API FUNCTIONS
-# =============================================
-
-def get_orchestrator_token(config: dict) -> Optional[str]:
-    """Authenticate with Orchestrator and get access token."""
-    token_url = f"{config['orch_url']}/identity/connect/token"
-    
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": config["orch_client_id"],
-        "client_secret": config["orch_client_secret"],
-        "scope": config["orch_scope"],
-    }
-    
-    try:
-        response = requests.post(token_url, data=payload, timeout=30)
-        response.raise_for_status()
-        return response.json().get("access_token")
-    except requests.RequestException as e:
-        st.error(f"❌ Erro ao autenticar no Orchestrator: {e}")
-        return None
-
-
-def upload_package_to_orchestrator(
-    config: dict,
-    token: str,
-    nupkg_path: str,
-    folder_id: Optional[int] = None
-) -> Tuple[bool, str]:
-    """Upload a .nupkg package to Orchestrator."""
-    upload_url = f"{config['orch_url']}/{config['orch_org']}/{config['orch_tenant']}/orchestrator_/odata/Processes/UiPath.Server.Configuration.OData.UploadPackage"
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-UIPATH-TenantName": config["orch_tenant"],
-    }
-    
-    if folder_id:
-        headers["X-UIPATH-OrganizationUnitId"] = str(folder_id)
-    
-    try:
-        with open(nupkg_path, "rb") as f:
-            files = {"file": (os.path.basename(nupkg_path), f, "application/octet-stream")}
-            response = requests.post(upload_url, headers=headers, files=files, timeout=120)
-            
-        if response.status_code in [200, 201]:
-            return True, "✅ Pacote enviado com sucesso!"
-        else:
-            return False, f"❌ Erro ({response.status_code}): {response.text}"
-    except requests.RequestException as e:
-        return False, f"❌ Erro de conexão: {e}"
-
-
-def download_package_from_orchestrator(
-    config: dict,
-    token: str,
-    package_id: str,
-    version: str,
-    output_dir: str
-) -> Tuple[bool, str]:
-    """Download a package from Orchestrator."""
-    download_url = f"{config['orch_url']}/{config['orch_org']}/{config['orch_tenant']}/orchestrator_/odata/Processes/UiPath.Server.Configuration.OData.DownloadPackage(key='{package_id}',version='{version}')"
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-UIPATH-TenantName": config["orch_tenant"],
-    }
-    
-    try:
-        response = requests.get(download_url, headers=headers, timeout=120, stream=True)
-        response.raise_for_status()
-        
-        filename = f"{package_id}.{version}.nupkg"
-        output_path = os.path.join(output_dir, filename)
-        
-        with open(output_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        return True, output_path
-    except requests.RequestException as e:
-        return False, f"❌ Erro ao baixar pacote: {e}"
-
-
-def list_orchestrator_packages(config: dict, token: str) -> List[dict]:
-    """List packages from Orchestrator."""
-    url = f"{config['orch_url']}/{config['orch_org']}/{config['orch_tenant']}/orchestrator_/odata/Processes"
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-UIPATH-TenantName": config["orch_tenant"],
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        return response.json().get("value", [])
-    except requests.RequestException as e:
-        st.error(f"❌ Erro ao listar pacotes: {e}")
-        return []
-
-
-# =============================================
-# GIT OPERATIONS
-# =============================================
-
-def clean_temp_files(repo_path: str) -> List[str]:
-    """Remove temporary files and directories from repository."""
-    patterns_to_remove = [".local", ".screenshots", ".objects", "__pycache__", ".vs"]
-    removed = []
-    
-    for root, dirs, files in os.walk(repo_path, topdown=True):
-        for pattern in patterns_to_remove:
-            if pattern in dirs:
-                dir_path = os.path.join(root, pattern)
-                try:
-                    shutil.rmtree(dir_path)
-                    removed.append(dir_path)
-                except Exception as e:
-                    st.warning(f"⚠️ Não foi possível remover {dir_path}: {e}")
-                dirs.remove(pattern)
-    
-    return removed
-
-
-def clone_repository(repo_url: str, target_dir: str, github_token: str = "", clean_temps: bool = True) -> Tuple[bool, str]:
-    """Clone a Git repository. Uses github_token for authentication if provided."""
-    try:
-        # Ensure target directory exists
-        os.makedirs(target_dir, exist_ok=True)
-        
-        # If github token is provided and URL is from GitHub, inject token for auth
-        auth_url = repo_url
-        if github_token and "github.com" in repo_url:
-            # Convert https://github.com/user/repo.git to https://token@github.com/user/repo.git
-            auth_url = repo_url.replace("https://github.com", f"https://{github_token}@github.com")
-            auth_url = auth_url.replace("http://github.com", f"http://{github_token}@github.com")
-        
-        # Clone the repository
-        repo = Repo.clone_from(auth_url, target_dir, progress=None)
-        
-        message = f"✅ Repositório clonado em: {target_dir}"
-        
-        # Clean temporary files if requested
-        if clean_temps:
-            removed = clean_temp_files(target_dir)
-            if removed:
-                message += f"\n🧹 Removidos {len(removed)} diretórios temporários"
-        
-        return True, message
-    except GitCommandError as e:
-        # Remove token from error message for security
-        error_msg = str(e)
-        if github_token:
-            error_msg = error_msg.replace(github_token, "***TOKEN***")
-        return False, f"❌ Erro Git: {error_msg}"
-    except Exception as e:
-        return False, f"❌ Erro: {e}"
-
-
-def sync_fork(repo_path: str, upstream_url: str, branch: str = "main") -> Tuple[bool, str]:
-    """Sync a forked repository with upstream."""
-    try:
-        repo = Repo(repo_path)
-        
-        # Add or update upstream remote
-        if "upstream" not in [r.name for r in repo.remotes]:
-            repo.create_remote("upstream", upstream_url)
-        else:
-            repo.remotes.upstream.set_url(upstream_url)
-        
-        # Fetch upstream
-        repo.remotes.upstream.fetch()
-        
-        # Reset hard to upstream branch
-        repo.git.reset("--hard", f"upstream/{branch}")
-        
-        # Force push to origin
-        repo.remotes.origin.push(force=True)
-        
-        return True, f"✅ Fork sincronizado com upstream/{branch} e push forçado para origin"
-    except GitCommandError as e:
-        return False, f"❌ Erro Git: {e}"
-    except Exception as e:
-        return False, f"❌ Erro: {e}"
-
-
-# =============================================
-# BUILD & PUBLISH FUNCTIONS
-# =============================================
-
-def run_uipath_pack(
-    project_path: str,
-    output_dir: str,
-    version: str,
-    use_local_cache: bool = True,
-    custom_feed_url: Optional[str] = None
-) -> Tuple[bool, str, str]:
-    """Run UiPath CLI pack command."""
-    
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Build the command with proper quoting for paths with spaces
-    cmd_parts = [
-        "uipcli",
-        "package", "pack",
-        f'"{project_path}"',
-        "--output",
-        f'"{output_dir}"',
-        "--version",
-        version,
-    ]
-    
-    # Add custom feed source if provided
-    if custom_feed_url and custom_feed_url.strip():
-        cmd_parts.extend(["--source", f'"{custom_feed_url.strip()}"'])
-    
-    cmd = " ".join(cmd_parts)
-    
-    try:
-        # Run the command
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-        
-        output = result.stdout + result.stderr
-        success = result.returncode == 0
-        
-        return success, cmd, output
-    except subprocess.TimeoutExpired:
-        return False, cmd, "❌ Timeout: O comando excedeu o limite de 5 minutos"
-    except Exception as e:
-        return False, cmd, f"❌ Erro: {e}"
-
-
-def find_nupkg_files(directory: str) -> List[str]:
-    """Find all .nupkg files in a directory."""
-    nupkg_files = []
-    if os.path.exists(directory):
-        for file in os.listdir(directory):
-            if file.endswith(".nupkg"):
-                nupkg_files.append(os.path.join(directory, file))
-    return sorted(nupkg_files, key=os.path.getmtime, reverse=True)
-
-
-def check_dependency_errors(output: str) -> List[str]:
-    """Check for dependency errors in build output."""
-    errors = []
-    
-    patterns = [
-        r"Unable to resolve dependency",
-        r"Could not find package",
-        r"Package '.*' is not found",
-        r"Missing dependency",
-        r"NU1101",  # NuGet error code for package not found
-        r"NU1102",  # NuGet error code for package version not found
-    ]
-    
-    for line in output.split("\n"):
-        for pattern in patterns:
-            if re.search(pattern, line, re.IGNORECASE):
-                errors.append(line.strip())
-                break
-    
-    return errors
-
-
-# =============================================
-# GITHUB FUNCTIONS
-# =============================================
-
-def get_github_client(token: str) -> Optional[Github]:
-    """Create GitHub client."""
-    try:
-        return Github(token)
-    except Exception as e:
-        st.error(f"❌ Erro ao conectar ao GitHub: {e}")
-        return None
-
-
-def get_open_pull_requests(github_client: Github, repo_name: str) -> List[dict]:
-    """Get open pull requests for a repository."""
-    try:
-        repo = github_client.get_repo(repo_name)
-        pulls = repo.get_pulls(state="open", sort="created", direction="desc")
-        
-        pr_list = []
-        for pr in pulls:
-            pr_list.append({
-                "number": pr.number,
-                "title": pr.title,
-                "author": pr.user.login,
-                "created_at": pr.created_at,
-                "updated_at": pr.updated_at,
-                "labels": [label.name for label in pr.labels],
-                "url": pr.html_url,
-                "draft": pr.draft,
-                "mergeable": pr.mergeable,
-                "head_branch": pr.head.ref,
-                "base_branch": pr.base.ref,
-            })
-        
-        return pr_list
-    except GithubException as e:
-        st.error(f"❌ Erro ao buscar PRs: {e}")
-        return []
 
 
 # =============================================
@@ -468,11 +143,26 @@ def render_sidebar(config: dict):
     
     # Custom Feed URL override
     st.sidebar.markdown("### 📦 NuGet Feed")
+    
+    # Construct default feed from Orchestrator config if available
+    default_feed = config["custom_nuget_feed"]
+    if not default_feed and all([config["orch_url"], config["orch_org"], config["orch_tenant"]]):
+        default_feed = f"{config['orch_url']}/{config['orch_org']}/{config['orch_tenant']}/orchestrator_/nuget/v3/index.json"
+    
     custom_feed = st.sidebar.text_input(
         "Custom Feed URL",
-        value=config["custom_nuget_feed"],
-        help="URL do feed NuGet customizado (Orchestrator ou Artifactory)"
+        value=default_feed,
+        help="URL do feed NuGet (Preenchido automaticamente com o Orchestrator Feed se disponível)"
     )
+    
+    # Allow overriding scopes in UI for debugging
+    custom_scope = st.sidebar.text_input(
+        "Orchestrator Scopes",
+        value=config["orch_scope"],
+        help="Escopos para autenticação (ex: OR.Settings.Read OR.Folders.Read). Ajuste conforme sua External App."
+    )
+    if custom_scope:
+        config["orch_scope"] = custom_scope
     
     st.sidebar.markdown("---")
     
@@ -485,7 +175,22 @@ def render_sidebar(config: dict):
 
 
 # =============================================
-# MAIN APPLICATION SECTIONS
+# HELPER FUNCTIONS
+# =============================================
+
+def load_local_projects(base_dir: str):
+    """Scan and cache local projects."""
+    if "local_projects" not in st.session_state:
+        st.session_state["local_projects"] = scan_local_projects(base_dir)
+    return st.session_state["local_projects"]
+
+
+def refresh_projects(base_dir: str):
+    """Force refresh of local projects."""
+    st.session_state["local_projects"] = scan_local_projects(base_dir)
+
+# =============================================
+# SECTIONS
 # =============================================
 
 def section_git_operations(config: dict):
@@ -498,84 +203,93 @@ def section_git_operations(config: dict):
         st.markdown("#### Clone de Repositório")
         
         col1, col2 = st.columns([2, 1])
-        
         with col1:
-            repo_url = st.text_input(
-                "URL do Repositório",
-                placeholder="https://github.com/org/repo.git",
-                key="clone_repo_url"
-            )
-        
+            repo_url = st.text_input("URL do Repositório", placeholder="https://github.com/org/repo.git")
         with col2:
-            target_dir = st.text_input(
-                "Diretório de Destino",
-                value=config["default_clone_dir"],
-                key="clone_target_dir"
-            )
-        
-        clean_temps = st.checkbox(
-            "🧹 Limpar arquivos temporários após clone (.local, .screenshots)",
-            value=True,
-            key="clone_clean_temps"
-        )
-        
-        if st.button("📥 Clonar Repositório", type="primary", key="btn_clone"):
+            target_dir = st.text_input("Diretório Base", value=config["default_clone_dir"])
+            
+        if st.button("📥 Clonar Repositório", type="primary"):
             if repo_url and target_dir:
-                with st.spinner("Clonando repositório..."):
-                    # Extract repo name for folder
+                with st.spinner("Clonando..."):
                     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
                     full_target = os.path.join(target_dir, repo_name)
                     
-                    success, message = clone_repository(
-                        repo_url, 
-                        full_target, 
-                        github_token=config["github_token"],
-                        clean_temps=clean_temps
-                    )
-                    
-                    if success:
-                        st.success(message)
-                    else:
-                        st.error(message)
-            else:
-                st.warning("⚠️ Preencha a URL do repositório e o diretório de destino")
+                    try:
+                        # Simple clone for now
+                        Repo.clone_from(repo_url, full_target)
+                        st.success(f"✅ Clonado em: {full_target}")
+                        refresh_projects(config["default_clone_dir"])
+                    except Exception as e:
+                        st.error(f"❌ Erro: {e}")
     
     with tab2:
         st.markdown("#### Sincronizar Fork com Upstream")
-        st.info("ℹ️ Esta operação faz: Fetch Upstream → Reset Hard → Push Force")
         
-        col1, col2 = st.columns(2)
+        # Project Selector
+        projects = load_local_projects(config["default_clone_dir"])
+        project_options = {p["name"]: p for p in projects}
         
-        with col1:
-            fork_path = st.text_input(
-                "Caminho do Fork Local",
-                placeholder="C:\\UiPath\\Repos\\meu-fork",
-                key="sync_fork_path"
-            )
-            upstream_url = st.text_input(
-                "URL do Upstream",
-                placeholder="https://github.com/original-org/original-repo.git",
-                key="sync_upstream_url"
-            )
+        # Display Grid Project Cards
+        if projects:
+            st.markdown("##### 📁 Projetos Locais Disponíveis")
+            for project in projects:
+                with st.container():
+                     cols = st.columns([0.1, 0.6, 0.3])
+                     cols[0].markdown("📁")
+                     cols[1].markdown(f"**{project['name']}** (v{project['version']})")
+                     if project.get('is_fork'):
+                         cols[2].markdown("`🍴 Fork`")
         
-        with col2:
-            branch = st.text_input(
-                "Branch",
-                value="main",
-                key="sync_branch"
-            )
-        
-        if st.button("🔃 Sincronizar Fork", type="primary", key="btn_sync"):
-            if fork_path and upstream_url:
-                with st.spinner("Sincronizando fork..."):
-                    success, message = sync_fork(fork_path, upstream_url, branch)
-                    
-                    if success:
-                        st.success(message)
-                    else:
-                        st.error(message)
-            else:
-                st.warning("⚠️ Preencha o caminho do fork e a URL do upstream")
+        st.markdown("---")
+
+        col_sel, col_btn = st.columns([3, 1])
+        with col_sel:
+            selected_name = st.selectbox("Selecione o Projeto Local para Sync", options=list(project_options.keys()) if projects else [])
+        with col_btn:
+            st.write("") # Spacer
+            st.write("")
+            if st.button("🔄 Refresh Lista"):
+                refresh_projects(config["default_clone_dir"])
+                st.rerun()
+
+        if selected_name:
+            project = project_options[selected_name]
+            st.info(f"📁 Path: `{project['path']}`")
+            
+            # Auto-detect upstream
+            remote_info = detect_remote_info(project['path'])
+            default_upstream = remote_info.get("current_upstream") or remote_info.get("inferred_upstream") or ""
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                upstream_url = st.text_input("URL do Upstream", value=default_upstream)
+                if remote_info.get("is_fork"):
+                    st.caption("ℹ️ Detectado que é um fork. Upstream sugerido.")
+            
+            with col2:
+                branch = st.text_input("Branch", value="main")
+                
+            if st.button("🔃 Sincronizar (Fetch Upstream + Reset + Push)", type="primary"):
+                if upstream_url:
+                    with st.spinner("Sincronizando..."):
+                        try:
+                            repo = Repo(project['path'])
+                            
+                            # Add/Update upstream
+                            if "upstream" in repo.remotes:
+                                repo.remotes.upstream.set_url(upstream_url)
+                            else:
+                                repo.create_remote("upstream", upstream_url)
+                                
+                            repo.remotes.upstream.fetch()
+                            repo.git.reset("--hard", f"upstream/{branch}")
+                            repo.remotes.origin.push(force=True)
+                            
+                            st.success(f"✅ Sincronizado com upstream/{branch} com sucesso!")
+                        except Exception as e:
+                            st.error(f"❌ Erro Git: {e}")
+                else:
+                    st.warning("⚠️ Informe a URL do Upstream")
 
 
 def section_pull_requests(config: dict):
@@ -583,350 +297,409 @@ def section_pull_requests(config: dict):
     st.markdown('<p class="section-header">📋 Pull Request Dashboard</p>', unsafe_allow_html=True)
     
     if not config["github_token"]:
-        st.warning("⚠️ Configure o GITHUB_TOKEN no arquivo .env para usar esta funcionalidade")
+        st.warning("⚠️ Configure o GITHUB_TOKEN no arquivo .env")
         return
+
+    gh_service = GithubService(config["github_token"])
     
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        repo_name = st.text_input(
-            "Repositório (owner/repo)",
-            placeholder="uipath/my-automation",
-            key="pr_repo_name"
-        )
-    
-    with col2:
+    # Inputs
+    cols = st.columns([2, 2, 1])
+    with cols[0]:
+        org_name = st.text_input("Organização", value=config["github_org"], placeholder="Ex: UiPath")
+    with cols[1]:
+        team_slug = st.text_input("Team Slug", value=config["github_team"], placeholder="Ex: rpa-devs")
+    with cols[2]:
         st.write("")
         st.write("")
-        refresh = st.button("🔄 Atualizar", key="btn_refresh_prs")
-    
-    if repo_name and (refresh or "pr_list" not in st.session_state):
-        github_client = get_github_client(config["github_token"])
-        
-        if github_client:
-            with st.spinner("Buscando Pull Requests..."):
-                prs = get_open_pull_requests(github_client, repo_name)
-                st.session_state["pr_list"] = prs
-    
-    if "pr_list" in st.session_state and st.session_state["pr_list"]:
-        prs = st.session_state["pr_list"]
-        
-        st.markdown(f"**{len(prs)} Pull Request(s) Aberto(s)**")
-        
-        for pr in prs:
-            with st.expander(f"#{pr['number']} - {pr['title']}", expanded=False):
-                col1, col2, col3 = st.columns(3)
+        search_btn = st.button("🔄 Buscar PRs", type="primary")
+
+    st.markdown("---")
+
+    if search_btn and org_name:
+        with st.spinner("Buscando repositórios e PRs..."):
+            repos = []
+            if team_slug:
+                repos = gh_service.get_team_repos(org_name, team_slug)
+                st.info(f"🔍 Encontrados {len(repos)} repositórios no time '{team_slug}'")
+            else:
+                st.warning("⚠️ Buscando apenas em um repositório específico? Use o campo abaixo.")
+                single_repo = st.text_input("Ou Repositório Único (org/repo)", key="single_repo")
+                if single_repo:
+                    repos = [single_repo]
+            
+            if repos:
+                prs = gh_service.get_all_team_prs(repos)
                 
-                with col1:
-                    st.markdown(f"**Autor:** {pr['author']}")
-                    st.markdown(f"**Branch:** `{pr['head_branch']}` → `{pr['base_branch']}`")
-                
-                with col2:
-                    st.markdown(f"**Criado:** {pr['created_at'].strftime('%d/%m/%Y %H:%M')}")
-                    st.markdown(f"**Atualizado:** {pr['updated_at'].strftime('%d/%m/%Y %H:%M')}")
-                
-                with col3:
-                    draft_badge = "🚧 Draft" if pr['draft'] else "✅ Ready"
-                    st.markdown(f"**Status:** {draft_badge}")
+                if not prs:
+                    st.info("🎉 Nenhum PR aberto encontrado!")
+                else:
+                    st.markdown(f"### 📊 {len(prs)} Pull Requests Abertos")
                     
-                    if pr['labels']:
-                        labels_str = ", ".join([f"`{l}`" for l in pr['labels']])
-                        st.markdown(f"**Labels:** {labels_str}")
-                
-                st.markdown(f"[🔗 Abrir no GitHub]({pr['url']})")
-    
-    elif "pr_list" in st.session_state:
-        st.info("📭 Nenhum Pull Request aberto encontrado")
+                    for pr in prs:
+                        with st.expander(f"[{pr.get('repo', 'Unknown')}] #{pr['number']} - {pr['title']}"):
+                            c1, c2, c3 = st.columns([2, 2, 1])
+                            
+                            with c1:
+                                st.markdown(f"**👤 Autor:** {pr['author']}")
+                                st.markdown(f"**🌿 Branch:** `{pr['head_branch']}` ➝ `{pr['base_branch']}`")
+                            
+                            with c2:
+                                st.markdown(f"**📅 Atualizado:** {pr['updated_at'].strftime('%d/%m/%Y %H:%M')}")
+                                if pr['labels']:
+                                    st.markdown(f"**🏷️ Labels:** {', '.join(pr['labels'])}")
+                            
+                            with c3:
+                                st.markdown(f"[🔗 Abrir no GitHub]({pr['url']})")
+                                if pr['draft']:
+                                    st.warning("🚧 Draft")
+                                else:
+                                    st.success("✅ Ready")
 
 
 def section_build_publish(config: dict, custom_feed: str):
     """Build & Publish section."""
     st.markdown('<p class="section-header">📦 Build & Publish</p>', unsafe_allow_html=True)
     
-    tab1, tab2 = st.tabs(["🔨 Build (Pack)", "🚀 Publish (Upload)"])
+    tab1, tab2, tab3 = st.tabs(["🔨 Build (Pack)", "🚀 Publish (Upload)", "📚 Libraries (Cache)"])
     
+    # --- BUILD TAB ---
     with tab1:
-        st.markdown("#### Empacotar Projeto UiPath")
+        pm = PackageManager()
+        
+        projects = load_local_projects(config["default_clone_dir"])
+        project_options = {f"{p['name']} (v{p['version']})": p for p in projects}
         
         col1, col2 = st.columns(2)
-        
         with col1:
-            project_path = st.text_input(
-                "Caminho do project.json",
-                placeholder="C:\\UiPath\\MyProject\\project.json",
-                key="build_project_path"
-            )
-            version = st.text_input(
-                "Versão",
-                value="1.0.0",
-                placeholder="1.0.0",
-                key="build_version"
-            )
-        
+            selected_label = st.selectbox("Selecione o Projeto", options=list(project_options.keys()) if projects else [])
         with col2:
-            output_dir = st.text_input(
-                "Diretório de Output",
-                value=config["default_output_dir"],
-                key="build_output_dir"
+             st.write("")
+             if st.button("🔄 Refresh Projetos", key="refresh_build"):
+                refresh_projects(config["default_clone_dir"])
+                st.rerun()
+        
+        if selected_label:
+            project = project_options[selected_label]
+            current_version = project['version']
+            
+            st.markdown(f"""
+                <div class="project-card">
+                    <div class="project-title">🔨 {project['name']}</div>
+                    <div class="project-meta">Versão Atual: <b>{current_version}</b> | Path: {project['path']}</div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("#### 🔢 Versionamento")
+            
+            # Version Bumping
+            bump_type = st.radio(
+                "Incrementar Versão:", 
+                ["Manter Atual", "Patch (+0.0.1)", "Minor (+0.1.0)", "Major (+1.0.0)"], 
+                horizontal=True
             )
             
-            use_local_cache = st.checkbox(
-                "📂 Usar Dependências Locais (.nuget cache)",
-                value=True,
-                key="build_use_local_cache"
-            )
-        
-        # Custom Feed URL
-        st.markdown("---")
-        st.markdown("**🌐 Feed de Dependências Customizado (Opcional)**")
-        
-        feed_url = st.text_input(
-            "Custom Feed URL",
-            value=custom_feed,
-            placeholder="https://cloud.uipath.com/.../nuget/v3/index.json",
-            help="Se informado, será adicionado --source ao comando pack",
-            key="build_feed_url"
-        )
-        
-        if feed_url:
-            st.info(f"ℹ️ O comando usará: `--source \"{feed_url}\"`")
-        
-        st.markdown("---")
-        
-        if st.button("📦 Pack", type="primary", key="btn_pack"):
-            if project_path and output_dir and version:
-                with st.spinner("Empacotando projeto..."):
-                    success, cmd, output = run_uipath_pack(
-                        project_path=project_path,
+            new_version = current_version
+            if "Patch" in bump_type:
+                new_version = increment_version(current_version, "patch")
+            elif "Minor" in bump_type:
+                new_version = increment_version(current_version, "minor")
+            elif "Major" in bump_type:
+                new_version = increment_version(current_version, "major")
+                
+            col_v1, col_v2 = st.columns(2)
+            with col_v1:
+                final_version = st.text_input("Versão Final para Pack", value=new_version)
+            with col_v2:
+                output_dir = st.text_input("Output Dir", value=config["default_output_dir"])
+            
+            st.checkbox("Usar dependências locais", value=True, key="use_local_cache", disabled=True)
+            
+            st.markdown("---")
+            
+            if st.button("📦 Criar Pacote (Pack)", type="primary"):
+                with st.spinner(f"Criando pacote v{final_version}..."):
+                    success, cmd, output = pm.run_pack(
+                        project_path=project['path'],
                         output_dir=output_dir,
-                        version=version,
-                        use_local_cache=use_local_cache,
-                        custom_feed_url=feed_url if feed_url else None
+                        version=final_version,
+                        custom_feed_url=custom_feed,
+                        auth_config=config  # Pass full config for auth
                     )
                     
-                    # Show command executed
-                    st.markdown("**Comando executado:**")
                     st.code(cmd, language="bash")
-                    
-                    # Show output
-                    st.markdown("**Output:**")
-                    st.code(output, language="text")
-                    
-                    # Check for dependency errors
-                    dep_errors = check_dependency_errors(output)
-                    
-                    if dep_errors:
-                        st.markdown("""
-                        <div class="error-highlight">
-                            <h4>⚠️ Erro de Dependência Detectado!</h4>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        
-                        st.error("**Dependências não encontradas:**")
-                        for error in dep_errors:
-                            st.markdown(f"- `{error}`")
-                        
-                        st.warning("""
-                        **💡 Sugestões:**
-                        1. Verifique se o pacote está disponível no Feed configurado
-                        2. Certifique-se de que a URL do Feed está correta
-                        3. Verifique suas credenciais de acesso ao Feed
-                        4. Tente limpar o cache NuGet local e rebuild
-                        """)
-                    
-                    elif success:
-                        st.success("✅ Pacote criado com sucesso!")
-                        
-                        # List generated packages
-                        packages = find_nupkg_files(output_dir)
-                        if packages:
-                            st.markdown("**📦 Pacotes gerados:**")
-                            for pkg in packages[:5]:  # Show last 5
-                                st.markdown(f"- `{os.path.basename(pkg)}`")
+                    if success:
+                        st.success("✅ Build realizado com sucesso!")
+                        st.text_area("Log de Output", output, height=100)
                     else:
-                        st.error("❌ Falha ao criar pacote. Verifique o output acima.")
-            else:
-                st.warning("⚠️ Preencha todos os campos obrigatórios")
-    
-    with tab2:
-        st.markdown("#### Upload para Orchestrator")
-        
-        if not all([config["orch_client_id"], config["orch_client_secret"]]):
-            st.warning("⚠️ Configure ORCH_CLIENT_ID e ORCH_CLIENT_SECRET no arquivo .env")
-            return
-        
-        # List available packages
-        packages_dir = st.text_input(
-            "Diretório dos Pacotes",
-            value=config["default_output_dir"],
-            key="publish_packages_dir"
-        )
-        
-        if packages_dir and os.path.exists(packages_dir):
-            packages = find_nupkg_files(packages_dir)
-            
-            if packages:
-                st.markdown(f"**📦 {len(packages)} pacote(s) encontrado(s):**")
-                
-                selected_package = st.selectbox(
-                    "Selecione o pacote para upload",
-                    options=packages,
-                    format_func=lambda x: os.path.basename(x),
-                    key="publish_selected_package"
-                )
-                
-                folder_id = st.text_input(
-                    "Folder ID (opcional)",
-                    placeholder="123",
-                    help="ID da pasta do Orchestrator (deixe vazio para pasta padrão)",
-                    key="publish_folder_id"
-                )
-                
-                if st.button("🚀 Upload para Orchestrator", type="primary", key="btn_upload"):
-                    with st.spinner("Autenticando e enviando..."):
-                        # Get token
-                        token = get_orchestrator_token(config)
+                        st.error("❌ Falha no build")
+                        st.text_area("Erro", output, height=150)
                         
-                        if token:
-                            success, message = upload_package_to_orchestrator(
-                                config=config,
-                                token=token,
-                                nupkg_path=selected_package,
-                                folder_id=int(folder_id) if folder_id else None
-                            )
+                        errors = pm.check_dependency_errors(output)
+                        if errors:
+                            st.warning("⚠️ Erros de Dependência:")
+                            for err in errors:
+                                st.markdown(f"- {err}")
+
+    # --- PUBLISH TAB ---
+    with tab2:
+        st.markdown("#### 🚀 Publicação (Tenant Level)")
+        st.info("ℹ️ Os pacotes serão publicados no Tenant, ficando disponíveis para todas as pastas (Modern Folders).")
+        
+        orch_service = OrchestratorService(config)
+        pm = PackageManager()
+        
+        packages_dir = st.text_input("Diretório de Pacotes", value=config["default_output_dir"], key="pub_dir")
+        
+        all_packages = pm.find_nupkg_files(packages_dir)
+        
+        # Split into Pending and Uploaded logic
+        uploaded_dir = os.path.join(packages_dir, "uploaded")
+        uploaded_packages = pm.find_nupkg_files(uploaded_dir) if os.path.exists(uploaded_dir) else []
+        
+        # We only want to show packages in the root dir as "Pending" (exclude uploaded subfolder if scanned)
+        pending_packages = [p for p in all_packages if "uploaded" not in p]
+        
+        st.markdown(f"### ⏳ Pendentes ({len(pending_packages)})")
+        
+        # Multi-select for batch upload
+        selected_packages = []
+        if not pending_packages:
+            st.info("Nenhum pacote pendente encontrado.")
+        else:
+            with st.container():
+                for pkg in pending_packages:
+                    c1, c2 = st.columns([0.1, 0.9])
+                    if c1.checkbox("", key=f"chk_{pkg}"):
+                        selected_packages.append(pkg)
+                    c2.markdown(f"📦 `{os.path.basename(pkg)}`")
+            
+            st.markdown("---")
+            if st.button(f"🚀 Enviar {len(selected_packages)} Pacotes Selecionados", disabled=len(selected_packages)==0, type="primary"):
+                token = orch_service.get_token()
+                if token:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    for idx, pkg_path in enumerate(selected_packages):
+                        pkg_name = os.path.basename(pkg_path)
+                        status_text.text(f"Enviando {pkg_name}...")
+                        
+                        success, msg = orch_service.upload_package(token, pkg_path)
+                        
+                        if success:
+                            st.toast(f"✅ {pkg_name} enviado!")
+                            pm.move_to_uploaded(pkg_path, packages_dir)
+                        else:
+                            st.error(f"❌ Falha em {pkg_name}: {msg}")
+                            
+                        progress_bar.progress((idx + 1) / len(selected_packages))
+                        
+                    st.success("Operação concluída!")
+                    st.rerun()
+                
+        if uploaded_packages:
+            st.markdown("---")
+            with st.expander(f"✅ Já Enviados (Pasta /uploaded) - {len(uploaded_packages)}"):
+                for pkg in uploaded_packages:
+                    st.text(f"✔️ {os.path.basename(pkg)}")
+
+    # --- LIBRARIES TAB ---
+    with tab3:
+        st.markdown("#### 📚 Gerenciamento de Libraries")
+        st.info("ℹ️ Baixe libraries do Orchestrator para o cache local NuGet. Isso resolve problemas de autenticação durante o build.")
+        
+        orch_service = OrchestratorService(config)
+        
+        # Search and list libraries
+        col_search, col_btn = st.columns([3, 1])
+        with col_search:
+            search_term = st.text_input(
+                "Buscar Library", 
+                placeholder="Ex: Smarthis",
+                help="Busca pelo ID da library no Orchestrator"
+            )
+        with col_btn:
+            st.write("")
+            st.write("")
+            search_clicked = st.button("🔍 Buscar", type="primary")
+        
+        if search_clicked and search_term:
+            with st.spinner("Buscando libraries no Orchestrator (incluindo todas versões)..."):
+                token = orch_service.get_token()
+                if token:
+                    # Use the new method that fetches all versions for each package
+                    grouped = orch_service.list_libraries_with_all_versions(token, search_term)
+                    
+                    if grouped:
+                        st.session_state["grouped_libraries"] = grouped
+                        total_versions = sum(len(pkg["versions"]) for pkg in grouped.values())
+                        st.success(f"✅ Encontrados {len(grouped)} pacotes com {total_versions} versões")
+                    else:
+                        st.warning("Nenhuma library encontrada com esse termo")
+                        st.session_state["grouped_libraries"] = {}
+                else:
+                    st.error("❌ Falha ao autenticar no Orchestrator")
+        
+        # Display found libraries grouped by package
+        if "grouped_libraries" in st.session_state and st.session_state["grouped_libraries"]:
+            st.markdown("---")
+            st.markdown("### 📋 Libraries Encontradas")
+            st.caption("Selecione os pacotes e versões que deseja baixar:")
+            
+            # Initialize selection state
+            if "lib_selections" not in st.session_state:
+                st.session_state["lib_selections"] = {}
+            
+            for pkg_id, pkg_info in st.session_state["grouped_libraries"].items():
+                with st.container():
+                    col1, col2, col3 = st.columns([0.08, 0.52, 0.40])
+                    
+                    with col1:
+                        is_selected = st.checkbox("", key=f"pkg_sel_{pkg_id}", value=pkg_id in st.session_state.get("lib_selections", {}))
+                    
+                    with col2:
+                        st.markdown(f"**{pkg_id}**")
+                        if pkg_info.get("authors"):
+                            st.caption(f"por {pkg_info['authors']}")
+                    
+                    with col3:
+                        # Version dropdown
+                        versions = pkg_info["versions"]
+                        selected_version = st.selectbox(
+                            "Versão",
+                            options=versions,
+                            key=f"pkg_ver_{pkg_id}",
+                            label_visibility="collapsed"
+                        )
+                        
+                        # Update selection state
+                        if is_selected:
+                            st.session_state["lib_selections"][pkg_id] = selected_version
+                        elif pkg_id in st.session_state.get("lib_selections", {}):
+                            del st.session_state["lib_selections"][pkg_id]
+            
+            st.markdown("---")
+            
+            selected_count = len(st.session_state.get("lib_selections", {}))
+            
+            if st.button(f"📥 Baixar e Instalar {selected_count} Libraries Selecionadas", 
+                        disabled=selected_count == 0, 
+                        type="primary"):
+                token = orch_service.get_token()
+                if token:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    # Create temp directory for downloads
+                    import tempfile
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        selections = list(st.session_state["lib_selections"].items())
+                        for idx, (lib_id, lib_version) in enumerate(selections):
+                            
+                            status_text.text(f"Baixando {lib_id} v{lib_version}...")
+                            
+                            # Download
+                            success, result = orch_service.download_library(token, lib_id, lib_version, temp_dir)
                             
                             if success:
-                                st.success(message)
+                                # Install to cache
+                                status_text.text(f"Instalando {lib_id} no cache...")
+                                install_success, install_msg = orch_service.install_nupkg_to_cache(result)
+                                
+                                if install_success:
+                                    st.toast(f"✅ {lib_id} v{lib_version} instalado!")
+                                else:
+                                    st.error(f"❌ Erro ao instalar {lib_id}: {install_msg}")
                             else:
-                                st.error(message)
-            else:
-                st.info("📭 Nenhum pacote .nupkg encontrado no diretório")
-        elif packages_dir:
-            st.warning("⚠️ Diretório não encontrado")
+                                st.error(f"❌ Erro ao baixar {lib_id}: {result}")
+                            
+                            progress_bar.progress((idx + 1) / len(selections))
+                    
+                    st.success("✅ Operação concluída! Agora você pode executar o Build.")
+                    # Clear selections
+                    st.session_state["lib_selections"] = {}
+                else:
+                    st.error("❌ Falha ao obter token de autenticação")
+        
+        # Quick install section
+        st.markdown("---")
+        with st.expander("⚡ Instalação Rápida (Digite ID e Versão)"):
+            col_id, col_ver = st.columns(2)
+            with col_id:
+                quick_lib_id = st.text_input("Library ID", placeholder="Smarthis.Common.Activities")
+            with col_ver:
+                quick_lib_version = st.text_input("Versão", placeholder="1.0.0")
+            
+            if st.button("📥 Baixar e Instalar", key="quick_install"):
+                if quick_lib_id and quick_lib_version:
+                    token = orch_service.get_token()
+                    if token:
+                        with st.spinner(f"Baixando {quick_lib_id}..."):
+                            import tempfile
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                success, result = orch_service.download_library(
+                                    token, quick_lib_id, quick_lib_version, temp_dir
+                                )
+                                
+                                if success:
+                                    install_success, install_msg = orch_service.install_nupkg_to_cache(result)
+                                    if install_success:
+                                        st.success(install_msg)
+                                    else:
+                                        st.error(install_msg)
+                                else:
+                                    st.error(result)
+                    else:
+                        st.error("❌ Falha ao autenticar")
+                else:
+                    st.warning("⚠️ Preencha ID e Versão da library")
 
 
 def section_tenant_migration(config: dict):
     """Tenant Migration section."""
     st.markdown('<p class="section-header">🔄 Tenant Migration</p>', unsafe_allow_html=True)
+    st.info("ℹ️ Migração simplificada usando os novos serviços.")
     
-    if not all([config["orch_client_id"], config["orch_client_secret"]]):
-        st.warning("⚠️ Configure as credenciais do Orchestrator no arquivo .env")
-        return
+    orch = OrchestratorService(config)
     
-    st.info("ℹ️ Migre pacotes entre tenants: Download do tenant origem → Upload no tenant destino")
+    c1, c2 = st.columns(2)
+    source_tenant = c1.text_input("Tenant Origem", value=config["orch_tenant"])
+    dest_tenant = c2.text_input("Tenant Destino")
     
-    col1, col2 = st.columns(2)
+    pkg_id = st.text_input("ID do Pacote")
+    pkg_ver = st.text_input("Versão")
     
-    with col1:
-        st.markdown("#### 📥 Tenant Origem")
-        
-        source_tenant = st.text_input(
-            "Nome do Tenant Origem",
-            value=config["orch_tenant"],
-            key="mig_source_tenant"
-        )
-        
-        package_id = st.text_input(
-            "Package ID",
-            placeholder="MyAutomation",
-            key="mig_package_id"
-        )
-        
-        package_version = st.text_input(
-            "Versão",
-            placeholder="1.0.0",
-            key="mig_package_version"
-        )
-    
-    with col2:
-        st.markdown("#### 📤 Tenant Destino")
-        
-        dest_tenant = st.text_input(
-            "Nome do Tenant Destino",
-            placeholder="ProductionTenant",
-            key="mig_dest_tenant"
-        )
-        
-        dest_folder_id = st.text_input(
-            "Folder ID no Destino (opcional)",
-            placeholder="456",
-            key="mig_dest_folder_id"
-        )
-    
-    st.markdown("---")
-    
-    # Temporary directory for migration
-    temp_dir = st.text_input(
-        "Diretório Temporário",
-        value=tempfile.gettempdir(),
-        key="mig_temp_dir"
-    )
-    
-    if st.button("🔄 Migrar Pacote", type="primary", key="btn_migrate"):
-        if all([source_tenant, package_id, package_version, dest_tenant]):
-            with st.spinner("Migrando pacote..."):
-                # Step 1: Get token for source tenant
-                source_config = config.copy()
-                source_config["orch_tenant"] = source_tenant
+    if st.button("Migrar Pacote"):
+        if source_tenant and dest_tenant and pkg_id and pkg_ver:
+            with st.spinner("Processando..."):
+                # 1. Auth Source
+                orch.tenant = source_tenant
+                t1 = orch.get_token()
+                if not t1: return
                 
-                st.markdown("**1️⃣ Autenticando no tenant origem...**")
-                source_token = get_orchestrator_token(source_config)
-                
-                if not source_token:
-                    st.error("❌ Falha ao autenticar no tenant origem")
+                # 2. Download
+                tmp = tempfile.gettempdir()
+                ok, path = orch.download_package(t1, pkg_id, pkg_ver, tmp)
+                if not ok: 
+                    st.error(path)
                     return
+                st.info(f"Baixado: {path}")
                 
-                st.success("✅ Autenticado no tenant origem")
+                # 3. Auth Dest
+                orch.tenant = dest_tenant
+                t2 = orch.get_token()
+                if not t2: return
                 
-                # Step 2: Download package
-                st.markdown("**2️⃣ Baixando pacote...**")
-                success, result = download_package_from_orchestrator(
-                    source_config, source_token, package_id, package_version, temp_dir
-                )
-                
-                if not success:
-                    st.error(result)
-                    return
-                
-                downloaded_path = result
-                st.success(f"✅ Pacote baixado: {os.path.basename(downloaded_path)}")
-                
-                # Step 3: Get token for destination tenant
-                st.markdown("**3️⃣ Autenticando no tenant destino...**")
-                dest_config = config.copy()
-                dest_config["orch_tenant"] = dest_tenant
-                
-                dest_token = get_orchestrator_token(dest_config)
-                
-                if not dest_token:
-                    st.error("❌ Falha ao autenticar no tenant destino")
-                    return
-                
-                st.success("✅ Autenticado no tenant destino")
-                
-                # Step 4: Upload to destination
-                st.markdown("**4️⃣ Enviando pacote para destino...**")
-                success, message = upload_package_to_orchestrator(
-                    dest_config,
-                    dest_token,
-                    downloaded_path,
-                    int(dest_folder_id) if dest_folder_id else None
-                )
-                
-                if success:
-                    st.success(message)
-                    st.balloons()
-                    
-                    # Cleanup
-                    try:
-                        os.remove(downloaded_path)
-                        st.info("🧹 Arquivo temporário removido")
-                    except:
-                        pass
+                # 4. Upload
+                ok, msg = orch.upload_package(t2, path)
+                if ok:
+                    st.success(f"Migrado com sucesso! {msg}")
                 else:
-                    st.error(message)
-        else:
-            st.warning("⚠️ Preencha todos os campos obrigatórios")
+                    st.error(f"Erro no upload: {msg}")
+                
+                # Cleanup
+                try: os.remove(path) 
+                except: pass
 
 
 # =============================================
@@ -935,23 +708,18 @@ def section_tenant_migration(config: dict):
 
 def main():
     """Main application entry point."""
-    # Header
     st.markdown('<p class="main-header">🤖 UiPath Team Coordinator</p>', unsafe_allow_html=True)
-    st.markdown("*Painel de Controle para gerenciar repositórios Git, Dependências e Deploy de automações UiPath*")
+    st.markdown("*Painel de Controle Modular - v2.0*")
     st.markdown("---")
     
-    # Load configuration
     config = get_env_config()
-    
-    # Render sidebar and get custom feed URL
     custom_feed = render_sidebar(config)
     
-    # Create tabs for main sections
     tabs = st.tabs([
         "🔄 Git Operations",
         "📋 Pull Requests",
         "📦 Build & Publish",
-        "🔄 Tenant Migration"
+        "🔄 Migração"
     ])
     
     with tabs[0]:
@@ -966,16 +734,8 @@ def main():
     with tabs[3]:
         section_tenant_migration(config)
     
-    # Footer
     st.markdown("---")
-    st.markdown(
-        """
-        <div style="text-align: center; color: #666; font-size: 0.9rem;">
-            <p>UiPath Team Coordinator v1.0.0 | Built with Streamlit 💙</p>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    st.caption("UiPath Team Coordinator | Architecture: Modular Services")
 
 
 if __name__ == "__main__":

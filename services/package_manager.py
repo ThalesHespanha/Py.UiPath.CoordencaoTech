@@ -2,6 +2,7 @@ import os
 import shutil
 import re
 import subprocess
+import tempfile
 from typing import Tuple, List, Optional
 from pathlib import Path
 
@@ -12,9 +13,15 @@ class PackageManager:
         output_dir: str,
         version: str,
         use_local_cache: bool = True,
-        custom_feed_url: Optional[str] = None
+        custom_feed_url: Optional[str] = None,
+        auth_config: Optional[dict] = None,
+        use_orchestrator_feeds: bool = False  # New flag to optionally try Orch feeds
     ) -> Tuple[bool, str, str]:
-        """Run UiPath CLI pack command."""
+        """Run UiPath CLI pack command.
+        
+        Uses only public NuGet feeds + local cache by default.
+        Orchestrator packages should be pre-downloaded via the Libraries tab.
+        """
         
         os.makedirs(output_dir, exist_ok=True)
         
@@ -28,12 +35,67 @@ class PackageManager:
             version,
         ]
         
-        if custom_feed_url and custom_feed_url.strip():
-            cmd_parts.extend(["--source", f'"{custom_feed_url.strip()}"'])
-        
-        cmd = " ".join(cmd_parts)
+        temp_config_path = None
         
         try:
+            # Create a simplified nuget.config with only PUBLIC feeds
+            # This avoids auth issues with Orchestrator feeds
+            # Private packages should be pre-installed via Libraries tab
+            
+            nuget_config_content = """<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <!-- Public Official UiPath Feeds -->
+    <add key="UiPathOfficial" value="https://pkgs.dev.azure.com/uipath/Public.Feeds/_packaging/UiPath-Official/nuget/v3/index.json" />
+    <add key="UiPathGallery" value="https://gallery.uipath.com/api/v3/index.json" />
+    <!-- Public NuGet.org -->
+    <add key="NuGetOrg" value="https://api.nuget.org/v3/index.json" />
+  </packageSources>
+</configuration>"""
+
+            # Optionally add Orchestrator feeds if user wants to try them
+            if use_orchestrator_feeds and auth_config:
+                org = auth_config.get("orch_org", "")
+                tenant = auth_config.get("orch_tenant", "")
+                base_url = auth_config.get("orch_url", "https://cloud.uipath.com").rstrip("/")
+                
+                if org and tenant:
+                    # Add library authentication params (may or may not work)
+                    cmd_parts.extend([
+                        "--libraryOrchestratorAccountForApp", f'"{org}"',
+                        "--libraryOrchestratorApplicationId", f'"{auth_config.get("orch_client_id", "")}"',
+                        "--libraryOrchestratorApplicationSecret", f'"{auth_config.get("orch_client_secret", "")}"',
+                        "--libraryOrchestratorApplicationScope", f'"{auth_config.get("orch_scope", "OR.Default")}"',
+                        "--libraryOrchestratorUrl", f'"{base_url}"',
+                        "--libraryOrchestratorTenant", f'"{tenant}"',
+                    ])
+                    
+                    # Add Orchestrator feeds to config
+                    orch_feed = f"{base_url}/{org}/{tenant}/orchestrator_/nuget/v3/index.json"
+                    lib_feed = f"{base_url}/{org}/{tenant}/orchestrator_/nuget/Libraries/v3/index.json"
+                    
+                    nuget_config_content = f"""<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="OrchestratorLibraries" value="{lib_feed}" />
+    <add key="OrchestratorProcesses" value="{orch_feed}" />
+    <add key="UiPathOfficial" value="https://pkgs.dev.azure.com/uipath/Public.Feeds/_packaging/UiPath-Official/nuget/v3/index.json" />
+    <add key="UiPathGallery" value="https://gallery.uipath.com/api/v3/index.json" />
+    <add key="NuGetOrg" value="https://api.nuget.org/v3/index.json" />
+  </packageSources>
+</configuration>"""
+
+            # Write the nuget config
+            fd, temp_config_path = tempfile.mkstemp(suffix=".config", prefix="nuget_")
+            os.close(fd)
+            with open(temp_config_path, "w") as f:
+                f.write(nuget_config_content)
+            cmd_parts.extend(["--nugetConfigFilePath", f'"{temp_config_path}"'])
+            
+            cmd = " ".join(cmd_parts)
+            
             result = subprocess.run(
                 cmd,
                 shell=True,
@@ -46,10 +108,18 @@ class PackageManager:
             success = result.returncode == 0
             
             return success, cmd, output
+            
         except subprocess.TimeoutExpired:
             return False, cmd, "❌ Timeout: O comando excedeu o limite de 5 minutos"
         except Exception as e:
             return False, cmd, f"❌ Erro: {e}"
+        finally:
+            # Cleanup temp file
+            if temp_config_path and os.path.exists(temp_config_path):
+                try:
+                    os.remove(temp_config_path)
+                except:
+                    pass
 
     @staticmethod
     def find_nupkg_files(directory: str) -> List[str]:
