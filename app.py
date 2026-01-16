@@ -111,6 +111,7 @@ def get_env_config() -> dict:
     return {
         "github_token": os.getenv("GITHUB_TOKEN", ""),
         "orch_url": os.getenv("ORCH_URL", "https://cloud.uipath.com"),
+        "orch_org": os.getenv("ORCH_ORG_NAME", ""),
         "orch_tenant": os.getenv("ORCH_TENANT_NAME", ""),
         "orch_client_id": os.getenv("ORCH_CLIENT_ID", ""),
         "orch_client_secret": os.getenv("ORCH_CLIENT_SECRET", ""),
@@ -126,6 +127,7 @@ def check_credentials(config: dict) -> dict:
     return {
         "GitHub Token": bool(config["github_token"]),
         "Orchestrator URL": bool(config["orch_url"]),
+        "Orchestrator Org": bool(config["orch_org"]),
         "Orchestrator Tenant": bool(config["orch_tenant"]),
         "Orchestrator Client ID": bool(config["orch_client_id"]),
         "Orchestrator Client Secret": bool(config["orch_client_secret"]),
@@ -163,7 +165,7 @@ def upload_package_to_orchestrator(
     folder_id: Optional[int] = None
 ) -> Tuple[bool, str]:
     """Upload a .nupkg package to Orchestrator."""
-    upload_url = f"{config['orch_url']}/{config['orch_tenant']}/orchestrator_/odata/Processes/UiPath.Server.Configuration.OData.UploadPackage"
+    upload_url = f"{config['orch_url']}/{config['orch_org']}/{config['orch_tenant']}/orchestrator_/odata/Processes/UiPath.Server.Configuration.OData.UploadPackage"
     
     headers = {
         "Authorization": f"Bearer {token}",
@@ -194,7 +196,7 @@ def download_package_from_orchestrator(
     output_dir: str
 ) -> Tuple[bool, str]:
     """Download a package from Orchestrator."""
-    download_url = f"{config['orch_url']}/{config['orch_tenant']}/orchestrator_/odata/Processes/UiPath.Server.Configuration.OData.DownloadPackage(key='{package_id}',version='{version}')"
+    download_url = f"{config['orch_url']}/{config['orch_org']}/{config['orch_tenant']}/orchestrator_/odata/Processes/UiPath.Server.Configuration.OData.DownloadPackage(key='{package_id}',version='{version}')"
     
     headers = {
         "Authorization": f"Bearer {token}",
@@ -219,7 +221,7 @@ def download_package_from_orchestrator(
 
 def list_orchestrator_packages(config: dict, token: str) -> List[dict]:
     """List packages from Orchestrator."""
-    url = f"{config['orch_url']}/{config['orch_tenant']}/orchestrator_/odata/Processes"
+    url = f"{config['orch_url']}/{config['orch_org']}/{config['orch_tenant']}/orchestrator_/odata/Processes"
     
     headers = {
         "Authorization": f"Bearer {token}",
@@ -258,14 +260,21 @@ def clean_temp_files(repo_path: str) -> List[str]:
     return removed
 
 
-def clone_repository(repo_url: str, target_dir: str, clean_temps: bool = True) -> Tuple[bool, str]:
-    """Clone a Git repository."""
+def clone_repository(repo_url: str, target_dir: str, github_token: str = "", clean_temps: bool = True) -> Tuple[bool, str]:
+    """Clone a Git repository. Uses github_token for authentication if provided."""
     try:
         # Ensure target directory exists
         os.makedirs(target_dir, exist_ok=True)
         
+        # If github token is provided and URL is from GitHub, inject token for auth
+        auth_url = repo_url
+        if github_token and "github.com" in repo_url:
+            # Convert https://github.com/user/repo.git to https://token@github.com/user/repo.git
+            auth_url = repo_url.replace("https://github.com", f"https://{github_token}@github.com")
+            auth_url = auth_url.replace("http://github.com", f"http://{github_token}@github.com")
+        
         # Clone the repository
-        repo = Repo.clone_from(repo_url, target_dir, progress=None)
+        repo = Repo.clone_from(auth_url, target_dir, progress=None)
         
         message = f"✅ Repositório clonado em: {target_dir}"
         
@@ -277,7 +286,11 @@ def clone_repository(repo_url: str, target_dir: str, clean_temps: bool = True) -
         
         return True, message
     except GitCommandError as e:
-        return False, f"❌ Erro Git: {e}"
+        # Remove token from error message for security
+        error_msg = str(e)
+        if github_token:
+            error_msg = error_msg.replace(github_token, "***TOKEN***")
+        return False, f"❌ Erro Git: {error_msg}"
     except Exception as e:
         return False, f"❌ Erro: {e}"
 
@@ -513,7 +526,12 @@ def section_git_operations(config: dict):
                     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
                     full_target = os.path.join(target_dir, repo_name)
                     
-                    success, message = clone_repository(repo_url, full_target, clean_temps)
+                    success, message = clone_repository(
+                        repo_url, 
+                        full_target, 
+                        github_token=config["github_token"],
+                        clean_temps=clean_temps
+                    )
                     
                     if success:
                         st.success(message)
