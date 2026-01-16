@@ -13,6 +13,7 @@ from typing import Optional
 
 import streamlit as st
 from dotenv import load_dotenv
+from git import Repo
 
 # Services
 from services.project_scanner import scan_local_projects
@@ -197,7 +198,7 @@ def section_git_operations(config: dict):
     """Git Operations section."""
     st.markdown('<p class="section-header">🔄 Git Operations</p>', unsafe_allow_html=True)
     
-    tab1, tab2 = st.tabs(["📥 Clone Repository", "🔃 Sync Fork"])
+    tab1, tab2, tab3 = st.tabs(["📥 Clone Repository", "⬇️ Update from Remote", "🔃 Sync Fork"])
     
     with tab1:
         st.markdown("#### Clone de Repositório")
@@ -215,14 +216,95 @@ def section_git_operations(config: dict):
                     full_target = os.path.join(target_dir, repo_name)
                     
                     try:
-                        # Simple clone for now
-                        Repo.clone_from(repo_url, full_target)
+                        # Inject token into URL for private repo authentication
+                        clone_url = repo_url
+                        if config.get("github_token") and "https://" in repo_url:
+                            # Format: https://TOKEN@github.com/org/repo.git
+                            clone_url = repo_url.replace("https://", f"https://{config['github_token']}@")
+                        
+                        Repo.clone_from(clone_url, full_target)
                         st.success(f"✅ Clonado em: {full_target}")
                         refresh_projects(config["default_clone_dir"])
                     except Exception as e:
                         st.error(f"❌ Erro: {e}")
     
     with tab2:
+        st.markdown("#### 🔄 Atualizar Projetos Locais")
+        st.info("ℹ️ Atualiza os repositórios locais com as últimas mudanças do remote (git pull)")
+        
+        # Load projects
+        projects = load_local_projects(config["default_clone_dir"])
+        
+        if not projects:
+            st.warning("⚠️ Nenhum projeto encontrado. Clone algum repositório primeiro.")
+        else:
+            col_refresh, col_update_all = st.columns([1, 1])
+            with col_refresh:
+                if st.button("🔄 Refresh Lista", key="refresh_update"):
+                    refresh_projects(config["default_clone_dir"])
+                    st.rerun()
+            with col_update_all:
+                update_all = st.button("⬇️ Atualizar TODOS", type="primary")
+            
+            st.markdown("---")
+            
+            # Track update results
+            if update_all:
+                progress = st.progress(0)
+                status_text = st.empty()
+                results = {"success": 0, "failed": 0, "errors": []}
+                
+                for idx, project in enumerate(projects):
+                    status_text.text(f"Atualizando {project['name']}...")
+                    success, msg = git_pull_project(project['path'], config.get("github_token"))
+                    
+                    if success:
+                        results["success"] += 1
+                    else:
+                        results["failed"] += 1
+                        results["errors"].append(f"{project['name']}: {msg}")
+                    
+                    progress.progress((idx + 1) / len(projects))
+                
+                status_text.empty()
+                st.success(f"✅ {results['success']} projetos atualizados com sucesso!")
+                if results["failed"] > 0:
+                    st.warning(f"⚠️ {results['failed']} projetos com erros:")
+                    for err in results["errors"]:
+                        st.text(f"  • {err}")
+            else:
+                # Display individual projects with update buttons
+                for project in projects:
+                    with st.container():
+                        cols = st.columns([0.5, 0.1, 0.4])
+                        
+                        with cols[0]:
+                            st.markdown(f"**📁 {project['name']}**")
+                            st.caption(f"v{project['version']} | {project['path']}")
+                        
+                        with cols[1]:
+                            # Check if repo has changes
+                            try:
+                                repo = Repo(project['path'])
+                                if repo.is_dirty():
+                                    st.warning("⚠️")
+                                else:
+                                    st.success("✓")
+                            except Exception:
+                                st.error("❌")
+                        
+                        with cols[2]:
+                            if st.button("⬇️ Pull", key=f"pull_{project['name']}"):
+                                with st.spinner(f"Atualizando {project['name']}..."):
+                                    success, msg = git_pull_project(project['path'], config.get("github_token"))
+                                    if success:
+                                        st.success(f"✅ {msg}")
+                                    else:
+                                        st.error(f"❌ {msg}")
+                        
+                        st.markdown("---")
+
+    with tab3:
         st.markdown("#### Sincronizar Fork com Upstream")
         
         # Project Selector
@@ -244,11 +326,11 @@ def section_git_operations(config: dict):
 
         col_sel, col_btn = st.columns([3, 1])
         with col_sel:
-            selected_name = st.selectbox("Selecione o Projeto Local para Sync", options=list(project_options.keys()) if projects else [])
+            selected_name = st.selectbox("Selecione o Projeto Local para Sync", options=list(project_options.keys()) if projects else [], key="sync_select")
         with col_btn:
             st.write("") # Spacer
             st.write("")
-            if st.button("🔄 Refresh Lista"):
+            if st.button("🔄 Refresh Lista", key="refresh_sync"):
                 refresh_projects(config["default_clone_dir"])
                 st.rerun()
 
@@ -290,6 +372,46 @@ def section_git_operations(config: dict):
                             st.error(f"❌ Erro Git: {e}")
                 else:
                     st.warning("⚠️ Informe a URL do Upstream")
+
+
+def git_pull_project(project_path: str, github_token: str = None) -> tuple:
+    """
+    Perform git pull on a project.
+    Returns (success: bool, message: str)
+    """
+    try:
+        repo = Repo(project_path)
+        
+        # Check if repo is dirty (has uncommitted changes)
+        if repo.is_dirty():
+            return False, "Há mudanças não commitadas. Faça commit ou stash primeiro."
+        
+        # Get current branch
+        current_branch = repo.active_branch.name
+        
+        # Configure credentials if token provided
+        origin = repo.remotes.origin
+        original_url = origin.url
+        
+        # Inject token for private repos
+        if github_token and "https://" in original_url and "@" not in original_url:
+            auth_url = original_url.replace("https://", f"https://{github_token}@")
+            origin.set_url(auth_url)
+        
+        try:
+            # Fetch and pull
+            origin.fetch()
+            origin.pull(current_branch)
+            message = f"Atualizado branch '{current_branch}'"
+        finally:
+            # Restore original URL (don't leave token in config)
+            if github_token and "https://" in original_url:
+                origin.set_url(original_url)
+        
+        return True, message
+        
+    except Exception as e:
+        return False, str(e)
 
 
 def section_pull_requests(config: dict):
