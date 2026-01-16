@@ -293,7 +293,7 @@ def section_git_operations(config: dict):
 
 
 def section_pull_requests(config: dict):
-    """Pull Request Dashboard section."""
+    """Pull Request Dashboard section - using GraphQL for optimized performance."""
     st.markdown('<p class="section-header">📋 Pull Request Dashboard</p>', unsafe_allow_html=True)
     
     if not config["github_token"]:
@@ -303,57 +303,86 @@ def section_pull_requests(config: dict):
     gh_service = GithubService(config["github_token"])
     
     # Inputs
-    cols = st.columns([2, 2, 1])
+    cols = st.columns([2, 2, 1, 1])
     with cols[0]:
-        org_name = st.text_input("Organização", value=config["github_org"], placeholder="Ex: UiPath")
+        org_name = st.text_input("Organização", value=config["github_org"], placeholder="Ex: smarthis-ai")
     with cols[1]:
-        team_slug = st.text_input("Team Slug", value=config["github_team"], placeholder="Ex: rpa-devs")
+        team_slug = st.text_input("Team Slug", value=config["github_team"], placeholder="Ex: fs")
     with cols[2]:
         st.write("")
         st.write("")
         search_btn = st.button("🔄 Buscar PRs", type="primary")
+    with cols[3]:
+        st.write("")
+        st.write("")
+        force_refresh = st.button("🗑️ Limpar Cache")
+
+    if force_refresh:
+        st.cache_data.clear()
+        st.success("✅ Cache limpo! Clique em 'Buscar PRs' novamente.")
 
     st.markdown("---")
 
     if search_btn and org_name:
-        with st.spinner("Buscando repositórios e PRs..."):
-            repos = []
-            if team_slug:
-                repos = gh_service.get_team_repos(org_name, team_slug)
-                st.info(f"🔍 Encontrados {len(repos)} repositórios no time '{team_slug}'")
-            else:
-                st.warning("⚠️ Buscando apenas em um repositório específico? Use o campo abaixo.")
-                single_repo = st.text_input("Ou Repositório Único (org/repo)", key="single_repo")
-                if single_repo:
-                    repos = [single_repo]
-            
-            if repos:
-                prs = gh_service.get_all_team_prs(repos)
-                
-                if not prs:
-                    st.info("🎉 Nenhum PR aberto encontrado!")
+        import time
+        start_time = time.time()
+        
+        # First get team repos (for filtering)
+        team_repos = None
+        if team_slug:
+            with st.spinner("Buscando repositórios do time..."):
+                team_repos = gh_service.get_team_repos(org_name, team_slug)
+                if team_repos:
+                    st.info(f"🔍 Encontrados {len(team_repos)} repositórios no time '{team_slug}'")
                 else:
-                    st.markdown(f"### 📊 {len(prs)} Pull Requests Abertos")
+                    st.warning(f"⚠️ Nenhum repositório encontrado para o time '{team_slug}'. Buscando PRs de toda a organização.")
+        
+        # Use GraphQL to fetch ALL open PRs (much faster!)
+        with st.spinner("Buscando PRs via GraphQL (otimizado)..."):
+            prs = fetch_org_prs_cached(config["github_token"], org_name, tuple(team_repos) if team_repos else None)
+        
+        elapsed = time.time() - start_time
+        
+        if not prs:
+            st.info("🎉 Nenhum PR aberto encontrado!")
+        else:
+            st.markdown(f"### 📊 {len(prs)} Pull Requests Abertos")
+            st.caption(f"⚡ Tempo de busca: {elapsed:.2f}s")
+            
+            for pr in prs:
+                with st.expander(f"[{pr.get('repo', 'Unknown')}] #{pr['number']} - {pr['title']}"):
+                    c1, c2, c3 = st.columns([2, 2, 1])
                     
-                    for pr in prs:
-                        with st.expander(f"[{pr.get('repo', 'Unknown')}] #{pr['number']} - {pr['title']}"):
-                            c1, c2, c3 = st.columns([2, 2, 1])
-                            
-                            with c1:
-                                st.markdown(f"**👤 Autor:** {pr['author']}")
-                                st.markdown(f"**🌿 Branch:** `{pr['head_branch']}` ➝ `{pr['base_branch']}`")
-                            
-                            with c2:
-                                st.markdown(f"**📅 Atualizado:** {pr['updated_at'].strftime('%d/%m/%Y %H:%M')}")
-                                if pr['labels']:
-                                    st.markdown(f"**🏷️ Labels:** {', '.join(pr['labels'])}")
-                            
-                            with c3:
-                                st.markdown(f"[🔗 Abrir no GitHub]({pr['url']})")
-                                if pr['draft']:
-                                    st.warning("🚧 Draft")
-                                else:
-                                    st.success("✅ Ready")
+                    with c1:
+                        st.markdown(f"**👤 Autor:** {pr['author']}")
+                        st.markdown(f"**🌿 Branch:** `{pr['head_branch']}` ➝ `{pr['base_branch']}`")
+                    
+                    with c2:
+                        updated_at = pr['updated_at']
+                        if hasattr(updated_at, 'strftime'):
+                            st.markdown(f"**📅 Atualizado:** {updated_at.strftime('%d/%m/%Y %H:%M')}")
+                        else:
+                            st.markdown(f"**📅 Atualizado:** {updated_at}")
+                        if pr['labels']:
+                            st.markdown(f"**🏷️ Labels:** {', '.join(pr['labels'])}")
+                    
+                    with c3:
+                        st.markdown(f"[🔗 Abrir no GitHub]({pr['url']})")
+                        if pr['draft']:
+                            st.warning("🚧 Draft")
+                        else:
+                            st.success("✅ Ready")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_org_prs_cached(token: str, org_name: str, team_repos: tuple = None) -> list:
+    """
+    Cached function to fetch PRs via GraphQL.
+    TTL = 600 seconds (10 minutes).
+    team_repos must be a tuple (immutable) for caching to work.
+    """
+    gh_service = GithubService(token)
+    return gh_service.get_org_open_prs_graphql(org_name, list(team_repos) if team_repos else None)
 
 
 def section_build_publish(config: dict, custom_feed: str):
