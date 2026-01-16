@@ -10,10 +10,27 @@ Painel de Controle para gerenciar repositórios Git, Dependências e Deploy de a
 
 ## 📋 Funcionalidades
 
-- **Git Operations**: Clone de repositórios e sincronização de forks
-- **Pull Request Dashboard**: Visualização de PRs abertos via GitHub API
-- **Build & Publish**: Empacotamento de projetos UiPath com suporte a feeds NuGet customizados
-- **Tenant Migration**: Migração de pacotes entre tenants do Orchestrator
+### 🔄 Git Operations
+- **Clone Repository**: Clone de repositórios (com autenticação via token para repos privados)
+- **Update from Remote**: Atualização em lote dos repos locais
+  - ⬇️ **Pull**: Atualiza do remote
+  - ⬆️ **Push**: Commit e push com mensagem personalizada
+  - ↩️ **Undo**: Descarta mudanças locais não commitadas
+- **Sync Fork**: Sincronização de forks com upstream
+
+### 📋 Pull Request Dashboard
+- Visualização de PRs abertos via **GitHub GraphQL API** (otimizado)
+- Busca em menos de 10 segundos (vs 5+ minutos com REST API)
+- Cache de 10 minutos para respostas instantâneas
+- Filtragem por organização e time
+
+### 📦 Build & Publish
+- Empacotamento de projetos UiPath (`uipcli pack`)
+- Publicação no Orchestrator (Tenant level)
+- Gerenciamento de Libraries com cache NuGet local
+
+### 🔄 Tenant Migration
+- Migração de pacotes entre tenants do Orchestrator
 
 ---
 
@@ -109,7 +126,7 @@ Isso instalará:
 - `streamlit` - Interface web
 - `python-dotenv` - Carregamento de variáveis de ambiente
 - `GitPython` - Operações Git
-- `PyGithub` - API do GitHub
+- `PyGithub` - API do GitHub (REST + GraphQL)
 - `requests` - Requisições HTTP
 
 ### Passo 4: Configurar Variáveis de Ambiente
@@ -125,17 +142,21 @@ cp .env.example .env
 Edite o arquivo `.env` com suas credenciais:
 
 ```env
-# GitHub (para PR Dashboard)
+# GitHub (para PR Dashboard e Git Operations)
 GITHUB_TOKEN=ghp_seuTokenAqui
+GITHUB_ORG=sua-organizacao
+GITHUB_TEAM=seu-time
 
 # Orchestrator (para Build/Publish e Migration)
 ORCH_URL=https://cloud.uipath.com
+ORCH_ORG_NAME=SuaOrg
 ORCH_TENANT_NAME=SeuTenant
 ORCH_CLIENT_ID=seu_client_id
 ORCH_CLIENT_SECRET=seu_client_secret
 
-# Feed NuGet customizado (opcional)
-CUSTOM_NUGET_FEED=https://seu.feed.url/nuget
+# Diretórios padrão
+DEFAULT_CLONE_DIR=C:\UiPath\Repos
+DEFAULT_OUTPUT_DIR=C:\UiPath\Packages
 ```
 
 ---
@@ -182,11 +203,19 @@ A aplicação abrirá automaticamente no navegador em: **http://localhost:8501**
 
 ```
 CoordenacaoTech/
-├── app.py              # Aplicação principal Streamlit
-├── requirements.txt    # Dependências Python
-├── .env.example        # Template de configuração
-├── .env               # Suas credenciais (não versionar!)
-└── README.md          # Este arquivo
+├── app.py                      # Aplicação principal Streamlit
+├── requirements.txt            # Dependências Python
+├── .env.example                # Template de configuração
+├── .env                        # Suas credenciais (não versionar!)
+├── README.md                   # Este arquivo
+├── services/                   # Módulos de serviço
+│   ├── github_service.py       # GitHub API (REST + GraphQL)
+│   ├── orchestrator.py         # UiPath Orchestrator API
+│   ├── package_manager.py      # Gerenciamento de pacotes NuGet
+│   └── project_scanner.py      # Scanner de projetos locais
+└── utils/                      # Utilitários
+    ├── git_helpers.py          # Helpers para operações Git
+    └── version.py              # Utilitários de versionamento
 ```
 
 ---
