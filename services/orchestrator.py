@@ -167,10 +167,22 @@ class OrchestratorService:
             
             # Sort versions descending
             def version_key(v):
+                """
+                Create a sortable key for version strings.
+                Returns tuples of (type_priority, value) to avoid int/str comparison issues.
+                Numbers get priority 0, strings get priority 1, so numbers sort before strings.
+                """
                 try:
-                    return [int(x) if x.isdigit() else x for x in str(v).replace('-', '.').split('.')]
-                except:
-                    return [str(v)]
+                    parts = str(v).replace('-', '.').split('.')
+                    result = []
+                    for x in parts:
+                        if x.isdigit():
+                            result.append((0, int(x)))  # Numeric parts
+                        else:
+                            result.append((1, x.lower()))  # String parts (lowercase for consistent sorting)
+                    return result
+                except Exception:
+                    return [(1, str(v).lower())]
             
             sorted_versions = sorted(versions, reverse=True, key=version_key)
             
@@ -227,8 +239,16 @@ class OrchestratorService:
             grouped[lib_id]["versions"].append(lib.get("Version", "Unknown"))
         
         # Sort versions descending for each package
+        def safe_version_key(v):
+            """Version key that avoids int/str comparison issues."""
+            try:
+                parts = str(v).replace('-', '.').split('.')
+                return [(0, int(x)) if x.isdigit() else (1, x.lower()) for x in parts]
+            except Exception:
+                return [(1, str(v).lower())]
+        
         for pkg in grouped.values():
-            pkg["versions"] = sorted(pkg["versions"], reverse=True, key=lambda v: [int(x) if x.isdigit() else x for x in v.replace('-', '.').split('.')])
+            pkg["versions"] = sorted(pkg["versions"], reverse=True, key=safe_version_key)
         
         return grouped
 
