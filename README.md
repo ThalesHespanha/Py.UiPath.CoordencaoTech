@@ -56,7 +56,7 @@ Para usar as funcionalidades de Build, você precisa do UiPath CLI instalado.
 
 ```bash
 # Requer .NET 8 SDK instalado
-# https://dotnet.microsoft.com/download
+# [https://dotnet.microsoft.com/download](https://dotnet.microsoft.com/pt-br/download/dotnet/thank-you/sdk-8.0.417-windows-x64-installer)
 
 # Instalar UiPath CLI para Windows (usa o feed oficial da UiPath)
 dotnet tool install -g UiPath.CLI.Windows --add-source "https://pkgs.dev.azure.com/uipath/Public.Feeds/_packaging/UiPath-Official/nuget/v3/index.json"
