@@ -25,8 +25,12 @@ class DependencyInfo:
     resolved_version: Optional[str] = None
     # All resolved versions needed (unique) across all projects
     all_resolved_versions: List[str] = field(default_factory=list)
+    # Versions already installed in local NuGet cache
+    installed_versions: List[str] = field(default_factory=list)
     available_versions: List[str] = field(default_factory=list)
     exists_in_orchestrator: Optional[bool] = None
+    # True if ALL required versions are installed locally
+    installed_locally: Optional[bool] = None
     error_message: Optional[str] = None
 
 
@@ -382,3 +386,103 @@ def get_download_list(
     
     return to_download, already_exists
 
+
+def get_nuget_cache_path() -> str:
+    """Get the local NuGet packages cache path."""
+    return os.path.expanduser("~/.nuget/packages")
+
+
+def check_local_nuget_cache(
+    package_id: str,
+    version_specs: Set[str]
+) -> Tuple[List[str], bool]:
+    """
+    Check which versions of a package are installed in local NuGet cache.
+    
+    This is MUCH faster than querying Orchestrator API and can be used
+    to skip unnecessary network calls.
+    
+    Args:
+        package_id: Package ID to check (e.g., "Smarthis.Common.Activities")
+        version_specs: Version specifications from projects
+        
+    Returns:
+        Tuple of (list_of_installed_versions, all_specs_satisfied)
+    """
+    cache_path = get_nuget_cache_path()
+    package_dir = os.path.join(cache_path, package_id.lower())
+    
+    installed_versions = []
+    
+    if os.path.exists(package_dir) and os.path.isdir(package_dir):
+        # List all version folders
+        try:
+            for version_dir in os.listdir(package_dir):
+                version_path = os.path.join(package_dir, version_dir)
+                if os.path.isdir(version_path):
+                    # Check for .nupkg or .nuspec to confirm it's a valid install
+                    nupkg_file = os.path.join(version_path, f"{package_id.lower()}.{version_dir}.nupkg")
+                    nuspec_files = [f for f in os.listdir(version_path) if f.endswith('.nuspec')]
+                    
+                    if os.path.exists(nupkg_file) or nuspec_files:
+                        installed_versions.append(version_dir)
+        except Exception as e:
+            print(f"Warning: Error checking local cache for {package_id}: {e}")
+    
+    # Check if all required versions are installed
+    all_satisfied = False
+    if installed_versions and version_specs:
+        # Parse each spec and check if any installed version satisfies it
+        satisfied_specs = 0
+        for spec in version_specs:
+            spec_type, extracted = parse_version_spec(spec)
+            if extracted:
+                # Check if this version or compatible version is installed
+                if extracted in installed_versions:
+                    satisfied_specs += 1
+                else:
+                    # For minimum/range specs, check if any higher version is installed
+                    for v in installed_versions:
+                        if compare_versions(v, extracted) >= 0:
+                            satisfied_specs += 1
+                            break
+        
+        all_satisfied = satisfied_specs == len(version_specs)
+    
+    # Sort versions descending
+    if installed_versions:
+        installed_versions = sorted(
+            installed_versions, 
+            reverse=True, 
+            key=lambda v: [int(x) if x.isdigit() else 0 for x in v.split('.')]
+        )
+    
+    return installed_versions, all_satisfied
+
+
+def check_all_local_cache(
+    dependencies: Dict[str, DependencyInfo]
+) -> int:
+    """
+    Check local NuGet cache for ALL dependencies and update their installed_versions.
+    
+    This is a fast local check that should be done BEFORE querying Orchestrator.
+    
+    Args:
+        dependencies: Dict of DependencyInfo to check
+        
+    Returns:
+        Number of packages that are fully satisfied from local cache
+    """
+    fully_installed = 0
+    
+    for pkg_id, dep_info in dependencies.items():
+        installed, all_satisfied = check_local_nuget_cache(pkg_id, dep_info.version_specs)
+        
+        dep_info.installed_versions = installed
+        dep_info.installed_locally = all_satisfied
+        
+        if all_satisfied:
+            fully_installed += 1
+    
+    return fully_installed

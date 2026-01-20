@@ -25,6 +25,7 @@ from services.dependency_scanner import (
     format_projects_list,
     resolve_all_versions_for_package,
     get_download_list,
+    check_all_local_cache,
     DependencyInfo
 )
 from services.github_service import GithubService
@@ -33,7 +34,7 @@ from services.package_manager import PackageManager
 from services.dependency_resolver import DependencyResolver, count_total_packages
 
 # Utils
-from utils.version import increment_version
+from utils.version import increment_version, update_project_json_version
 from utils.git_helpers import detect_remote_info
 
 # =============================================
@@ -736,6 +737,15 @@ def section_build_publish(config: dict, custom_feed: str):
                     if success:
                         st.success("✅ Build realizado com sucesso!")
                         st.text_area("Log de Output", output, height=100)
+                        
+                        # Update project.json with new version
+                        update_ok, update_msg = update_project_json_version(
+                            project['path'], final_version
+                        )
+                        if update_ok:
+                            st.info(f"📝 {update_msg}")
+                        else:
+                            st.warning(f"⚠️ Não foi possível atualizar project.json: {update_msg}")
                     else:
                         st.error("❌ Falha no build")
                         st.text_area("Erro", output, height=150)
@@ -1048,76 +1058,100 @@ def section_build_publish(config: dict, custom_feed: str):
                             else:
                                 st.success(f"✅ Encontradas {len(custom_deps)} libs custom em {len(all_deps)} dependências totais")
                                 
-                                # Get token for validation
-                                token = orch_service.get_token()
-                                if not token:
-                                    st.error("❌ Falha ao autenticar no Orchestrator")
+                                # FIRST: Check local NuGet cache (fast!)
+                                status_placeholder = st.empty()
+                                status_placeholder.text("⚡ Verificando cache local NuGet...")
+                                
+                                fully_installed = check_all_local_cache(custom_deps)
+                                
+                                if fully_installed == len(custom_deps):
+                                    status_placeholder.empty()
+                                    st.success(f"🎉 Todas as {fully_installed} libs já estão instaladas localmente!")
+                                    # Still store for potential re-download
+                                    st.session_state["custom_deps_detected"] = custom_deps
+                                    st.session_state["sync_download_dir"] = download_dir
+                                    st.session_state["sync_install_cache"] = install_to_cache
+                                    st.session_state["sync_skip_existing"] = skip_existing
                                 else:
-                                    # Validate each lib against Orchestrator
-                                    version_cache = {}
-                                    progress = st.progress(0)
-                                    status_placeholder = st.empty()
+                                    # Show local cache results
+                                    local_installed = sum(1 for d in custom_deps.values() if d.installed_locally)
+                                    need_check = len(custom_deps) - local_installed
+                                    status_placeholder.info(f"📦 {local_installed} instaladas | 🔍 {need_check} precisam verificar no Orchestrator")
                                     
-                                    # Also track runtime packages to add
-                                    runtime_packages_to_add = {}
-                                    
-                                    dep_list = list(custom_deps.items())
-                                    for idx, (pkg_id, dep_info) in enumerate(dep_list):
-                                        status_placeholder.text(f"Verificando {pkg_id}...")
+                                    # Get token for validation of remaining libs
+                                    token = orch_service.get_token()
+                                    if not token:
+                                        st.error("❌ Falha ao autenticar no Orchestrator")
+                                    else:
+                                        # Validate each lib against Orchestrator (skip locally installed)
+                                        version_cache = {}
+                                        progress = st.progress(0)
                                         
-                                        # Check if exists in Orchestrator
-                                        exists, available_versions = orch_service.check_library_exists(
-                                            token, pkg_id, version_cache
-                                        )
+                                        # Also track runtime packages to add
+                                        runtime_packages_to_add = {}
                                         
-                                        dep_info.exists_in_orchestrator = exists
-                                        dep_info.available_versions = available_versions
+                                        # Filter to only check libs NOT fully installed locally
+                                        deps_to_check = [
+                                            (pkg_id, dep_info) for pkg_id, dep_info in custom_deps.items()
+                                            if not dep_info.installed_locally
+                                        ]
                                         
-                                        # Resolve ALL required versions (for all projects)
-                                        if exists and available_versions:
-                                            # Resolve best version (for display/primary)
-                                            first_spec = next(iter(dep_info.version_specs))
-                                            dep_info.resolved_version = resolve_best_version(
-                                                available_versions, first_spec
+                                        for idx, (pkg_id, dep_info) in enumerate(deps_to_check):
+                                            status_placeholder.text(f"Verificando {pkg_id} no Orchestrator...")
+                                        
+                                            # Check if exists in Orchestrator
+                                            exists, available_versions = orch_service.check_library_exists(
+                                                token, pkg_id, version_cache
                                             )
                                             
-                                            # Resolve ALL unique versions needed across projects
-                                            dep_info.all_resolved_versions = resolve_all_versions_for_package(
-                                                dep_info, available_versions
-                                            )
+                                            dep_info.exists_in_orchestrator = exists
+                                            dep_info.available_versions = available_versions
                                             
-                                            # Check for .Runtime companion package
-                                            # Common patterns: .Library.Runtime and .Runtime
-                                            runtime_variants = [
-                                                f"{pkg_id}.Library.Runtime",
-                                                f"{pkg_id}.Runtime"
-                                            ]
+                                            # Resolve ALL required versions (for all projects)
+                                            if exists and available_versions:
+                                                # Resolve best version (for display/primary)
+                                                first_spec = next(iter(dep_info.version_specs))
+                                                dep_info.resolved_version = resolve_best_version(
+                                                    available_versions, first_spec
+                                                )
+                                                
+                                                # Resolve ALL unique versions needed across projects
+                                                dep_info.all_resolved_versions = resolve_all_versions_for_package(
+                                                    dep_info, available_versions
+                                                )
+                                                
+                                                # Check for .Runtime companion package
+                                                # Common patterns: .Library.Runtime and .Runtime
+                                                runtime_variants = [
+                                                    f"{pkg_id}.Library.Runtime",
+                                                    f"{pkg_id}.Runtime"
+                                                ]
+                                                
+                                                for runtime_pkg_id in runtime_variants:
+                                                    if runtime_pkg_id not in custom_deps and runtime_pkg_id not in runtime_packages_to_add:
+                                                        status_placeholder.text(f"Verificando {runtime_pkg_id}...")
+                                                        rt_exists, rt_versions = orch_service.check_library_exists(
+                                                            token, runtime_pkg_id, version_cache
+                                                        )
+                                                        
+                                                        if rt_exists and rt_versions:
+                                                            # Create a dependency info for the runtime package
+                                                            rt_info = DependencyInfo(package_id=runtime_pkg_id)
+                                                            rt_info.exists_in_orchestrator = True
+                                                            rt_info.available_versions = rt_versions
+                                                            rt_info.resolved_version = resolve_best_version(
+                                                                rt_versions, first_spec  # Use same version spec
+                                                            )
+                                                            # Resolve all versions using same specs
+                                                            rt_info.all_resolved_versions = resolve_all_versions_for_package(
+                                                                dep_info, rt_versions  # Use parent's specs against runtime versions
+                                                            )
+                                                            rt_info.projects = dep_info.projects.copy()
+                                                            rt_info.version_specs = dep_info.version_specs.copy()
+                                                            rt_info.project_versions = dep_info.project_versions.copy()
+                                                            runtime_packages_to_add[runtime_pkg_id] = rt_info
                                             
-                                            for runtime_pkg_id in runtime_variants:
-                                                if runtime_pkg_id not in custom_deps and runtime_pkg_id not in runtime_packages_to_add:
-                                                    status_placeholder.text(f"Verificando {runtime_pkg_id}...")
-                                                    rt_exists, rt_versions = orch_service.check_library_exists(
-                                                        token, runtime_pkg_id, version_cache
-                                                    )
-                                                    
-                                                    if rt_exists and rt_versions:
-                                                        # Create a dependency info for the runtime package
-                                                        rt_info = DependencyInfo(package_id=runtime_pkg_id)
-                                                        rt_info.exists_in_orchestrator = True
-                                                        rt_info.available_versions = rt_versions
-                                                        rt_info.resolved_version = resolve_best_version(
-                                                            rt_versions, first_spec  # Use same version spec
-                                                        )
-                                                        # Resolve all versions using same specs
-                                                        rt_info.all_resolved_versions = resolve_all_versions_for_package(
-                                                            dep_info, rt_versions  # Use parent's specs against runtime versions
-                                                        )
-                                                        rt_info.projects = dep_info.projects.copy()
-                                                        rt_info.version_specs = dep_info.version_specs.copy()
-                                                        rt_info.project_versions = dep_info.project_versions.copy()
-                                                        runtime_packages_to_add[runtime_pkg_id] = rt_info
-                                        
-                                        progress.progress((idx + 1) / len(dep_list))
+                                            progress.progress((idx + 1) / len(deps_to_check))
                                     
                                     # Add detected runtime packages to the list
                                     if runtime_packages_to_add:
