@@ -17,6 +17,14 @@ from git import Repo
 
 # Services
 from services.project_scanner import scan_local_projects
+from services.dependency_scanner import (
+    scan_project_dependencies, 
+    filter_custom_dependencies,
+    resolve_best_version,
+    get_display_version,
+    format_projects_list,
+    DependencyInfo
+)
 from services.github_service import GithubService
 from services.orchestrator import OrchestratorService
 from services.package_manager import PackageManager
@@ -109,6 +117,10 @@ def get_env_config() -> dict:
         "custom_nuget_feed": os.getenv("CUSTOM_NUGET_FEED", ""),
         "default_clone_dir": os.getenv("DEFAULT_CLONE_DIR", "C:\\UiPath\\Repos"),
         "default_output_dir": os.getenv("DEFAULT_OUTPUT_DIR", "C:\\UiPath\\Packages"),
+        # Custom libs sync settings
+        "default_reference_dir": os.getenv("DEFAULT_REFERENCE_DIR", ""),
+        "default_libs_download_dir": os.getenv("DEFAULT_LIBS_DOWNLOAD_DIR", "C:\\UiPath\\CustomLibs"),
+        "custom_lib_prefixes": os.getenv("CUSTOM_LIB_PREFIXES", ""),
     }
 
 
@@ -912,6 +924,245 @@ def section_build_publish(config: dict, custom_feed: str):
                         st.error("❌ Falha ao autenticar")
                 else:
                     st.warning("⚠️ Preencha ID e Versão da library")
+        
+        # =============================================
+        # NEW: Custom Libraries Sync from Reference Folder
+        # =============================================
+        st.markdown("---")
+        with st.expander("🔁 Sincronizar libs custom dos projetos (pasta referência)"):
+            st.info("ℹ️ Detecta e baixa automaticamente todas as libs customizadas usadas nos projetos de uma pasta referência.")
+            
+            # --- Configuration Inputs ---
+            col_ref, col_dest = st.columns(2)
+            with col_ref:
+                # Default: use DEFAULT_REFERENCE_DIR if set, otherwise DEFAULT_CLONE_DIR
+                default_ref = config.get("default_reference_dir") or config["default_clone_dir"]
+                reference_dir = st.text_input(
+                    "📁 Pasta Referência (projetos UiPath)",
+                    value=default_ref,
+                    help="Pasta contendo subpastas com projetos UiPath (project.json)"
+                )
+            with col_dest:
+                download_dir = st.text_input(
+                    "📥 Pasta Destino (.nupkg)",
+                    value=config.get("default_libs_download_dir") or "C:\\UiPath\\CustomLibs",
+                    help="Onde salvar os arquivos .nupkg baixados"
+                )
+            
+            # Options row
+            col_opt1, col_opt2, col_opt3 = st.columns(3)
+            with col_opt1:
+                install_to_cache = st.checkbox(
+                    "Instalar no cache NuGet",
+                    value=True,
+                    help="Também instala em ~/.nuget/packages após baixar"
+                )
+            with col_opt2:
+                skip_existing = st.checkbox(
+                    "Pular se já existe",
+                    value=True,
+                    help="Não baixa novamente se arquivo já existe na pasta destino"
+                )
+            with col_opt3:
+                use_prefix_filter = st.checkbox(
+                    "Filtrar por prefixos",
+                    value=True,
+                    help="Filtra apenas libs que começam com prefixos custom"
+                )
+            
+            # Prefix input (shown only if filter enabled)
+            if use_prefix_filter:
+                default_prefixes = config.get("custom_lib_prefixes") or "Smarthis.,FS.,Ball."
+                custom_prefixes_input = st.text_input(
+                    "Prefixos custom (vírgula)",
+                    value=default_prefixes,
+                    help="Ex: Smarthis.,FS.,Ball. - Se vazio, exclui apenas pacotes oficiais (UiPath., System., Microsoft.)"
+                )
+                custom_prefixes = [p.strip() for p in custom_prefixes_input.split(",") if p.strip()]
+            else:
+                custom_prefixes = None
+            
+            st.markdown("---")
+            
+            # --- Detect Dependencies Button ---
+            col_detect, col_download = st.columns(2)
+            
+            with col_detect:
+                detect_clicked = st.button("🔎 Detectar dependências", type="primary", key="detect_deps")
+            
+            if detect_clicked:
+                if not reference_dir or not os.path.exists(reference_dir):
+                    st.error(f"❌ Pasta referência não encontrada: {reference_dir}")
+                else:
+                    with st.spinner("Escaneando projetos e dependências..."):
+                        # Scan all projects
+                        all_deps = scan_project_dependencies(reference_dir)
+                        
+                        if not all_deps:
+                            st.warning("⚠️ Nenhuma dependência encontrada. Verifique se a pasta contém projetos UiPath com project.json.")
+                        else:
+                            # Filter to custom libs only
+                            custom_deps = filter_custom_dependencies(
+                                all_deps, 
+                                custom_prefixes if use_prefix_filter else None,
+                                use_prefix_filter
+                            )
+                            
+                            if not custom_deps:
+                                st.warning("⚠️ Nenhuma lib custom encontrada com os filtros atuais.")
+                            else:
+                                st.success(f"✅ Encontradas {len(custom_deps)} libs custom em {len(all_deps)} dependências totais")
+                                
+                                # Get token for validation
+                                token = orch_service.get_token()
+                                if not token:
+                                    st.error("❌ Falha ao autenticar no Orchestrator")
+                                else:
+                                    # Validate each lib against Orchestrator
+                                    version_cache = {}
+                                    progress = st.progress(0)
+                                    status_placeholder = st.empty()
+                                    
+                                    dep_list = list(custom_deps.items())
+                                    for idx, (pkg_id, dep_info) in enumerate(dep_list):
+                                        status_placeholder.text(f"Verificando {pkg_id}...")
+                                        
+                                        # Check if exists in Orchestrator
+                                        exists, available_versions = orch_service.check_library_exists(
+                                            token, pkg_id, version_cache
+                                        )
+                                        
+                                        dep_info.exists_in_orchestrator = exists
+                                        dep_info.available_versions = available_versions
+                                        
+                                        # Resolve best version
+                                        if exists and available_versions:
+                                            first_spec = next(iter(dep_info.version_specs))
+                                            dep_info.resolved_version = resolve_best_version(
+                                                available_versions, first_spec
+                                            )
+                                        
+                                        progress.progress((idx + 1) / len(dep_list))
+                                    
+                                    status_placeholder.empty()
+                                    progress.empty()
+                                    
+                                    # Store in session state for download
+                                    st.session_state["custom_deps_detected"] = custom_deps
+                                    st.session_state["sync_download_dir"] = download_dir
+                                    st.session_state["sync_install_cache"] = install_to_cache
+                                    st.session_state["sync_skip_existing"] = skip_existing
+                                    
+                                    # Display results table
+                                    st.markdown("### 📋 Libs Custom Detectadas")
+                                    
+                                    # Build table data
+                                    table_data = []
+                                    for pkg_id, dep_info in sorted(custom_deps.items()):
+                                        status = "✅ Encontrada" if dep_info.exists_in_orchestrator else "❌ Não encontrada"
+                                        version = get_display_version(dep_info)
+                                        projects = format_projects_list(dep_info.projects)
+                                        table_data.append({
+                                            "Pacote": pkg_id,
+                                            "Versão": version,
+                                            "Projetos": projects,
+                                            "Status": status
+                                        })
+                                    
+                                    # Use st.dataframe for nice display
+                                    import pandas as pd
+                                    df = pd.DataFrame(table_data)
+                                    st.dataframe(df, use_container_width=True, hide_index=True)
+                                    
+                                    # Summary
+                                    found_count = sum(1 for d in custom_deps.values() if d.exists_in_orchestrator)
+                                    not_found = len(custom_deps) - found_count
+                                    st.info(f"📊 **Resumo:** {found_count} disponíveis para download, {not_found} não encontradas no Orchestrator")
+            
+            # --- Download Button ---
+            with col_download:
+                download_clicked = st.button(
+                    "📥 Baixar todas as libs", 
+                    type="secondary", 
+                    key="download_all_custom",
+                    disabled="custom_deps_detected" not in st.session_state
+                )
+            
+            if download_clicked and "custom_deps_detected" in st.session_state:
+                custom_deps = st.session_state["custom_deps_detected"]
+                target_dir = st.session_state.get("sync_download_dir", download_dir)
+                do_install = st.session_state.get("sync_install_cache", install_to_cache)
+                do_skip = st.session_state.get("sync_skip_existing", skip_existing)
+                
+                # Filter to only libs that exist
+                to_download = {
+                    pkg_id: info for pkg_id, info in custom_deps.items() 
+                    if info.exists_in_orchestrator and info.resolved_version
+                }
+                
+                if not to_download:
+                    st.warning("⚠️ Nenhuma lib disponível para download.")
+                else:
+                    token = orch_service.get_token()
+                    if not token:
+                        st.error("❌ Falha ao autenticar no Orchestrator")
+                    else:
+                        progress = st.progress(0)
+                        status_text = st.empty()
+                        results = {"success": 0, "skipped": 0, "failed": 0, "errors": []}
+                        
+                        download_list = list(to_download.items())
+                        for idx, (pkg_id, dep_info) in enumerate(download_list):
+                            version = dep_info.resolved_version
+                            status_text.text(f"Baixando {pkg_id} v{version}...")
+                            
+                            # Download
+                            success, result = orch_service.download_library_persistent(
+                                token, pkg_id, version, target_dir, do_skip
+                            )
+                            
+                            if success:
+                                # Check if it was skipped (file already existed)
+                                expected_file = os.path.join(target_dir, f"{pkg_id}.{version}.nupkg")
+                                
+                                # Install to cache if enabled
+                                if do_install:
+                                    status_text.text(f"Instalando {pkg_id} no cache...")
+                                    inst_ok, inst_msg = orch_service.install_nupkg_to_cache(result)
+                                    if inst_ok:
+                                        results["success"] += 1
+                                        st.toast(f"✅ {pkg_id} v{version}")
+                                    else:
+                                        results["failed"] += 1
+                                        results["errors"].append(f"{pkg_id}: {inst_msg}")
+                                else:
+                                    results["success"] += 1
+                                    st.toast(f"✅ {pkg_id} v{version}")
+                            else:
+                                results["failed"] += 1
+                                results["errors"].append(f"{pkg_id}: {result}")
+                            
+                            progress.progress((idx + 1) / len(download_list))
+                        
+                        status_text.empty()
+                        progress.empty()
+                        
+                        # Final summary
+                        st.markdown("### 📊 Resultado do Download")
+                        col_s1, col_s2 = st.columns(2)
+                        col_s1.metric("✅ Sucesso", results["success"])
+                        col_s2.metric("❌ Falhas", results["failed"])
+                        
+                        if results["errors"]:
+                            with st.expander("⚠️ Detalhes dos erros"):
+                                for err in results["errors"]:
+                                    st.text(f"• {err}")
+                        
+                        st.success(f"✅ Download concluído! Arquivos salvos em: {target_dir}")
+                        
+                        # Clear session state
+                        if "custom_deps_detected" in st.session_state:
+                            del st.session_state["custom_deps_detected"]
 
 
 def section_tenant_migration(config: dict):

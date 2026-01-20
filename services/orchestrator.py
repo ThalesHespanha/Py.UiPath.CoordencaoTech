@@ -370,3 +370,81 @@ class OrchestratorService:
             
         except Exception as e:
             return False, f"❌ Erro ao instalar no cache: {e}"
+
+    def check_library_exists(
+        self, 
+        token: str, 
+        package_id: str, 
+        cache: dict = None
+    ) -> tuple:
+        """
+        Check if a library exists in Orchestrator and get available versions.
+        Uses an optional cache dict for memoization across multiple calls.
+        
+        Args:
+            token: Auth token
+            package_id: Package ID to check
+            cache: Optional dict to cache results (pass same dict across calls)
+            
+        Returns:
+            Tuple[bool, List[str]]: (exists, list_of_versions)
+        """
+        # Check cache first
+        if cache is not None and package_id in cache:
+            cached = cache[package_id]
+            return (len(cached) > 0, cached)
+        
+        # Query Orchestrator
+        versions = self.get_library_versions(token, package_id)
+        
+        # Store in cache if provided
+        if cache is not None:
+            cache[package_id] = versions
+        
+        return (len(versions) > 0, versions)
+
+    def download_library_persistent(
+        self, 
+        token: str, 
+        package_id: str, 
+        version: str, 
+        target_dir: str, 
+        skip_existing: bool = True
+    ) -> tuple:
+        """
+        Download a library to a persistent directory (not temp).
+        
+        Args:
+            token: Auth token
+            package_id: Package ID to download
+            version: Version to download
+            target_dir: Destination directory (will be created if needed)
+            skip_existing: If True and file exists, skip download
+            
+        Returns:
+            Tuple[bool, str]: (success, file_path_or_error_message)
+        """
+        import os
+        
+        # Ensure target directory exists
+        os.makedirs(target_dir, exist_ok=True)
+        
+        # Build expected filename
+        filename = f"{package_id}.{version}.nupkg"
+        target_path = os.path.join(target_dir, filename)
+        
+        # Check if file already exists
+        if skip_existing and os.path.exists(target_path):
+            # Verify it's a valid file (not empty/corrupted)
+            if os.path.getsize(target_path) > 1000:
+                return True, target_path  # Already exists, skip
+        
+        # Download using existing method
+        success, result = self.download_library(token, package_id, version, target_dir)
+        
+        if success:
+            # Result is the file path from download_library
+            return True, result
+        else:
+            return False, result
+
