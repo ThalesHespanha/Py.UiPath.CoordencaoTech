@@ -38,20 +38,33 @@ class PackageManager:
         temp_config_path = None
         
         try:
-            # Create a simplified nuget.config with only PUBLIC feeds
-            # This avoids auth issues with Orchestrator feeds
-            # Private packages should be pre-installed via Libraries tab
+            # Get local NuGet cache path
+            local_cache_path = os.path.expanduser("~/.nuget/packages")
             
-            nuget_config_content = """<?xml version="1.0" encoding="utf-8"?>
+            # Create a nuget.config with:
+            # 1. Local cache (for pre-downloaded custom packages)
+            # 2. Public Official UiPath Feeds
+            # 3. NuGet.org
+            # 
+            # This ensures uipcli pack can find custom packages that were
+            # pre-downloaded via the Libraries tab.
+            
+            nuget_config_content = f"""<?xml version="1.0" encoding="utf-8"?>
 <configuration>
   <packageSources>
     <clear />
+    <!-- Local NuGet cache (pre-downloaded custom packages) -->
+    <add key="LocalCache" value="{local_cache_path}" />
     <!-- Public Official UiPath Feeds -->
     <add key="UiPathOfficial" value="https://pkgs.dev.azure.com/uipath/Public.Feeds/_packaging/UiPath-Official/nuget/v3/index.json" />
     <add key="UiPathGallery" value="https://gallery.uipath.com/api/v3/index.json" />
     <!-- Public NuGet.org -->
     <add key="NuGetOrg" value="https://api.nuget.org/v3/index.json" />
   </packageSources>
+  <config>
+    <!-- Use local cache as global packages folder -->
+    <add key="globalPackagesFolder" value="{local_cache_path}" />
+  </config>
 </configuration>"""
 
             # Optionally add Orchestrator feeds if user wants to try them

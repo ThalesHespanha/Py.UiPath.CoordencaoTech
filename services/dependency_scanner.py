@@ -20,7 +20,11 @@ class DependencyInfo:
     package_id: str
     version_specs: Set[str] = field(default_factory=set)
     projects: Set[str] = field(default_factory=set)
+    # Maps project_name -> version_spec for each project
+    project_versions: Dict[str, str] = field(default_factory=dict)
     resolved_version: Optional[str] = None
+    # All resolved versions needed (unique) across all projects
+    all_resolved_versions: List[str] = field(default_factory=list)
     available_versions: List[str] = field(default_factory=list)
     exists_in_orchestrator: Optional[bool] = None
     error_message: Optional[str] = None
@@ -74,6 +78,8 @@ def scan_project_dependencies(base_dir: str) -> Dict[str, DependencyInfo]:
                             
                             dependencies[pkg_id].version_specs.add(str(version_spec))
                             dependencies[pkg_id].projects.add(project_name)
+                            # Track which project uses which version
+                            dependencies[pkg_id].project_versions[project_name] = str(version_spec)
                             
                     except (json.JSONDecodeError, IOError) as e:
                         # Skip invalid project.json files
@@ -291,3 +297,88 @@ def format_projects_list(projects: Set[str], max_display: int = 3) -> str:
     if len(proj_list) <= max_display:
         return ", ".join(proj_list)
     return f"{', '.join(proj_list[:max_display])} (+{len(proj_list) - max_display} more)"
+
+
+def resolve_all_versions_for_package(
+    dep_info: DependencyInfo,
+    available_versions: List[str]
+) -> List[str]:
+    """
+    Resolve ALL unique versions required for a package across all projects.
+    
+    Args:
+        dep_info: DependencyInfo with version_specs from multiple projects
+        available_versions: List of versions available in Orchestrator (sorted desc)
+        
+    Returns:
+        List of resolved versions (unique, sorted descending)
+    """
+    if not available_versions:
+        return []
+    
+    resolved_set = set()
+    
+    for version_spec in dep_info.version_specs:
+        resolved = resolve_best_version(available_versions, version_spec)
+        if resolved:
+            resolved_set.add(resolved)
+    
+    # Sort descending (newest first)
+    return sorted(list(resolved_set), reverse=True, key=lambda v: [int(x) if x.isdigit() else 0 for x in v.split('.')])
+
+
+def check_files_exist_in_directory(
+    package_versions: List[tuple],
+    target_dir: str
+) -> Dict[tuple, bool]:
+    """
+    Check which (package_id, version) pairs already exist as .nupkg files in target directory.
+    
+    Args:
+        package_versions: List of (package_id, version) tuples
+        target_dir: Directory to check for existing files
+        
+    Returns:
+        Dict mapping (package_id, version) -> exists (bool)
+    """
+    result = {}
+    
+    for pkg_id, version in package_versions:
+        filename = f"{pkg_id}.{version}.nupkg"
+        filepath = os.path.join(target_dir, filename)
+        # File exists and is large enough to be a valid package
+        exists = os.path.exists(filepath) and os.path.getsize(filepath) > 1000
+        result[(pkg_id, version)] = exists
+    
+    return result
+
+
+def get_download_list(
+    custom_deps: Dict[str, DependencyInfo],
+    target_dir: str
+) -> tuple:
+    """
+    Build list of (package_id, version) pairs to download, excluding existing files.
+    
+    Args:
+        custom_deps: Dict of DependencyInfo with all_resolved_versions populated
+        target_dir: Directory to check for existing files
+        
+    Returns:
+        Tuple of (to_download, already_exists) where each is a list of (pkg_id, version)
+    """
+    all_versions = []
+    
+    for pkg_id, dep_info in custom_deps.items():
+        if dep_info.exists_in_orchestrator and dep_info.all_resolved_versions:
+            for version in dep_info.all_resolved_versions:
+                all_versions.append((pkg_id, version))
+    
+    # Check which already exist
+    existence = check_files_exist_in_directory(all_versions, target_dir)
+    
+    to_download = [pv for pv in all_versions if not existence.get(pv, False)]
+    already_exists = [pv for pv in all_versions if existence.get(pv, False)]
+    
+    return to_download, already_exists
+

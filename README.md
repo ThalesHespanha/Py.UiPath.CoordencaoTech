@@ -212,7 +212,9 @@ CoordenacaoTech/
 │   ├── github_service.py       # GitHub API (REST + GraphQL)
 │   ├── orchestrator.py         # UiPath Orchestrator API
 │   ├── package_manager.py      # Gerenciamento de pacotes NuGet
-│   └── project_scanner.py      # Scanner de projetos locais
+│   ├── project_scanner.py      # Scanner de projetos locais
+│   ├── dependency_scanner.py   # Scanner de dependências de project.json
+│   └── dependency_resolver.py  # Resolução transitiva de dependências (.nuspec)
 └── utils/                      # Utilitários
     ├── git_helpers.py          # Helpers para operações Git
     └── version.py              # Utilitários de versionamento

@@ -23,11 +23,14 @@ from services.dependency_scanner import (
     resolve_best_version,
     get_display_version,
     format_projects_list,
+    resolve_all_versions_for_package,
+    get_download_list,
     DependencyInfo
 )
 from services.github_service import GithubService
 from services.orchestrator import OrchestratorService
 from services.package_manager import PackageManager
+from services.dependency_resolver import DependencyResolver, count_total_packages
 
 # Utils
 from utils.version import increment_version
@@ -295,12 +298,44 @@ def section_git_operations(config: dict):
                             st.caption(f"v{project['version']}")
                         
                         with cols[1]:
-                            # Check if repo has changes
+                            # Check if repo has changes - only check is_dirty for icon
                             try:
                                 repo = Repo(project['path'])
                                 is_dirty = repo.is_dirty(untracked_files=True)
                                 if is_dirty:
-                                    st.warning("⚠️")
+                                    # Popover shows details ONLY when clicked (lazy load)
+                                    with st.popover("⚠️"):
+                                        st.markdown("**📝 Arquivos Alterados:**")
+                                        try:
+                                            # Helper: ignore files in folders starting with "."
+                                            def should_show(path):
+                                                parts = path.replace("\\", "/").split("/")
+                                                return not any(p.startswith(".") for p in parts)
+                                            
+                                            # Get changed files - computed only on popover open
+                                            changed = []
+                                            # Modified tracked files
+                                            for item in repo.index.diff(None):
+                                                if should_show(item.a_path):
+                                                    changed.append(f"📄 `{item.a_path}` (modificado)")
+                                            # Staged files
+                                            for item in repo.index.diff("HEAD"):
+                                                if should_show(item.a_path):
+                                                    changed.append(f"📄 `{item.a_path}` (staged)")
+                                            # Untracked files
+                                            for f in repo.untracked_files:
+                                                if should_show(f):
+                                                    changed.append(f"📄 `{f}` (novo)")
+                                            
+                                            if changed:
+                                                for c in changed[:10]:  # Limit to 10 files
+                                                    st.markdown(c)
+                                                if len(changed) > 10:
+                                                    st.caption(f"+{len(changed) - 10} arquivos...")
+                                            else:
+                                                st.caption("✅ Apenas arquivos ignorados (.local, .objects, etc)")
+                                        except Exception as e:
+                                            st.caption(f"Erro ao listar: {e}")
                                 else:
                                     st.success("✓")
                             except Exception:
@@ -1023,6 +1058,9 @@ def section_build_publish(config: dict, custom_feed: str):
                                     progress = st.progress(0)
                                     status_placeholder = st.empty()
                                     
+                                    # Also track runtime packages to add
+                                    runtime_packages_to_add = {}
+                                    
                                     dep_list = list(custom_deps.items())
                                     for idx, (pkg_id, dep_info) in enumerate(dep_list):
                                         status_placeholder.text(f"Verificando {pkg_id}...")
@@ -1035,14 +1073,56 @@ def section_build_publish(config: dict, custom_feed: str):
                                         dep_info.exists_in_orchestrator = exists
                                         dep_info.available_versions = available_versions
                                         
-                                        # Resolve best version
+                                        # Resolve ALL required versions (for all projects)
                                         if exists and available_versions:
+                                            # Resolve best version (for display/primary)
                                             first_spec = next(iter(dep_info.version_specs))
                                             dep_info.resolved_version = resolve_best_version(
                                                 available_versions, first_spec
                                             )
+                                            
+                                            # Resolve ALL unique versions needed across projects
+                                            dep_info.all_resolved_versions = resolve_all_versions_for_package(
+                                                dep_info, available_versions
+                                            )
+                                            
+                                            # Check for .Runtime companion package
+                                            # Common patterns: .Library.Runtime and .Runtime
+                                            runtime_variants = [
+                                                f"{pkg_id}.Library.Runtime",
+                                                f"{pkg_id}.Runtime"
+                                            ]
+                                            
+                                            for runtime_pkg_id in runtime_variants:
+                                                if runtime_pkg_id not in custom_deps and runtime_pkg_id not in runtime_packages_to_add:
+                                                    status_placeholder.text(f"Verificando {runtime_pkg_id}...")
+                                                    rt_exists, rt_versions = orch_service.check_library_exists(
+                                                        token, runtime_pkg_id, version_cache
+                                                    )
+                                                    
+                                                    if rt_exists and rt_versions:
+                                                        # Create a dependency info for the runtime package
+                                                        rt_info = DependencyInfo(package_id=runtime_pkg_id)
+                                                        rt_info.exists_in_orchestrator = True
+                                                        rt_info.available_versions = rt_versions
+                                                        rt_info.resolved_version = resolve_best_version(
+                                                            rt_versions, first_spec  # Use same version spec
+                                                        )
+                                                        # Resolve all versions using same specs
+                                                        rt_info.all_resolved_versions = resolve_all_versions_for_package(
+                                                            dep_info, rt_versions  # Use parent's specs against runtime versions
+                                                        )
+                                                        rt_info.projects = dep_info.projects.copy()
+                                                        rt_info.version_specs = dep_info.version_specs.copy()
+                                                        rt_info.project_versions = dep_info.project_versions.copy()
+                                                        runtime_packages_to_add[runtime_pkg_id] = rt_info
                                         
                                         progress.progress((idx + 1) / len(dep_list))
+                                    
+                                    # Add detected runtime packages to the list
+                                    if runtime_packages_to_add:
+                                        custom_deps.update(runtime_packages_to_add)
+                                        st.info(f"🔗 Detectados {len(runtime_packages_to_add)} pacotes .Runtime adicionais")
                                     
                                     status_placeholder.empty()
                                     progress.empty()
@@ -1058,13 +1138,21 @@ def section_build_publish(config: dict, custom_feed: str):
                                     
                                     # Build table data
                                     table_data = []
+                                    total_versions_to_download = 0
                                     for pkg_id, dep_info in sorted(custom_deps.items()):
                                         status = "✅ Encontrada" if dep_info.exists_in_orchestrator else "❌ Não encontrada"
-                                        version = get_display_version(dep_info)
+                                        # Show all versions if multiple, otherwise single version
+                                        if dep_info.all_resolved_versions:
+                                            versions_str = ", ".join(dep_info.all_resolved_versions)
+                                            total_versions_to_download += len(dep_info.all_resolved_versions)
+                                        else:
+                                            versions_str = get_display_version(dep_info)
+                                            if dep_info.exists_in_orchestrator:
+                                                total_versions_to_download += 1
                                         projects = format_projects_list(dep_info.projects)
                                         table_data.append({
                                             "Pacote": pkg_id,
-                                            "Versão": version,
+                                            "Versões": versions_str,
                                             "Projetos": projects,
                                             "Status": status
                                         })
@@ -1074,10 +1162,13 @@ def section_build_publish(config: dict, custom_feed: str):
                                     df = pd.DataFrame(table_data)
                                     st.dataframe(df, use_container_width=True, hide_index=True)
                                     
-                                    # Summary
+                                    # Check what already exists in target directory
+                                    to_download, already_exists = get_download_list(custom_deps, download_dir)
+                                    
+                                    # Summary with file existence info
                                     found_count = sum(1 for d in custom_deps.values() if d.exists_in_orchestrator)
                                     not_found = len(custom_deps) - found_count
-                                    st.info(f"📊 **Resumo:** {found_count} disponíveis para download, {not_found} não encontradas no Orchestrator")
+                                    st.info(f"📊 **Resumo:** {found_count} pacotes, {total_versions_to_download} versões | 📥 {len(to_download)} para baixar | ⏭️ {len(already_exists)} já existem")
             
             # --- Download Button ---
             with col_download:
@@ -1092,73 +1183,59 @@ def section_build_publish(config: dict, custom_feed: str):
                 custom_deps = st.session_state["custom_deps_detected"]
                 target_dir = st.session_state.get("sync_download_dir", download_dir)
                 do_install = st.session_state.get("sync_install_cache", install_to_cache)
-                do_skip = st.session_state.get("sync_skip_existing", skip_existing)
                 
-                # Filter to only libs that exist
-                to_download = {
-                    pkg_id: info for pkg_id, info in custom_deps.items() 
-                    if info.exists_in_orchestrator and info.resolved_version
-                }
+                # Use get_download_list to exclude files already in target directory
+                to_download, already_exists = get_download_list(custom_deps, target_dir)
                 
                 if not to_download:
-                    st.warning("⚠️ Nenhuma lib disponível para download.")
+                    if already_exists:
+                        st.info(f"⏭️ Todos os {len(already_exists)} arquivos já existem em: {target_dir}")
+                    else:
+                        st.warning("⚠️ Nenhuma lib disponível para download.")
                 else:
                     token = orch_service.get_token()
                     if not token:
                         st.error("❌ Falha ao autenticar no Orchestrator")
                     else:
-                        progress = st.progress(0)
-                        status_text = st.empty()
-                        results = {"success": 0, "skipped": 0, "failed": 0, "errors": []}
+                        # Use DependencyResolver for transitive resolution
+                        resolver = DependencyResolver(orch_service)
                         
-                        download_list = list(to_download.items())
-                        for idx, (pkg_id, dep_info) in enumerate(download_list):
-                            version = dep_info.resolved_version
-                            status_text.text(f"Baixando {pkg_id} v{version}...")
-                            
-                            # Download
-                            success, result = orch_service.download_library_persistent(
-                                token, pkg_id, version, target_dir, do_skip
-                            )
-                            
-                            if success:
-                                # Check if it was skipped (file already existed)
-                                expected_file = os.path.join(target_dir, f"{pkg_id}.{version}.nupkg")
-                                
-                                # Install to cache if enabled
-                                if do_install:
-                                    status_text.text(f"Instalando {pkg_id} no cache...")
-                                    inst_ok, inst_msg = orch_service.install_nupkg_to_cache(result)
-                                    if inst_ok:
-                                        results["success"] += 1
-                                        st.toast(f"✅ {pkg_id} v{version}")
-                                    else:
-                                        results["failed"] += 1
-                                        results["errors"].append(f"{pkg_id}: {inst_msg}")
-                                else:
-                                    results["success"] += 1
-                                    st.toast(f"✅ {pkg_id} v{version}")
-                            else:
-                                results["failed"] += 1
-                                results["errors"].append(f"{pkg_id}: {result}")
-                            
-                            progress.progress((idx + 1) / len(download_list))
+                        status_text = st.empty()
+                        skipped_msg = f" (⏭️ {len(already_exists)} já existem)" if already_exists else ""
+                        status_text.info(f"🔄 Baixando {len(to_download)} versões com dependências transitivas...{skipped_msg}")
+                        
+                        # Resolve all with transitive dependencies
+                        resolved, errors = resolver.resolve_all(
+                            token=token,
+                            root_packages=to_download,  # Now includes all versions
+                            target_dir=target_dir,
+                            install_to_cache=do_install
+                        )
                         
                         status_text.empty()
-                        progress.empty()
+                        
+                        # Get statistics
+                        stats = resolver.get_stats()
+                        main_count, transitive_count = count_total_packages(resolved)
                         
                         # Final summary
                         st.markdown("### 📊 Resultado do Download")
-                        col_s1, col_s2 = st.columns(2)
-                        col_s1.metric("✅ Sucesso", results["success"])
-                        col_s2.metric("❌ Falhas", results["failed"])
+                        col_s1, col_s2, col_s3 = st.columns(3)
+                        col_s1.metric("📦 Principais", main_count)
+                        col_s2.metric("🔗 Transitivas", transitive_count)
+                        col_s3.metric("✅ Instalados", stats["installed"])
                         
-                        if results["errors"]:
-                            with st.expander("⚠️ Detalhes dos erros"):
-                                for err in results["errors"]:
+                        col_s4, col_s5 = st.columns(2)
+                        col_s4.metric("⏭️ Já existiam", stats["skipped"])
+                        col_s5.metric("❌ Falhas", stats["failed"])
+                        
+                        if errors:
+                            with st.expander(f"⚠️ Detalhes dos erros ({len(errors)})"):
+                                for err in errors:
                                     st.text(f"• {err}")
                         
-                        st.success(f"✅ Download concluído! Arquivos salvos em: {target_dir}")
+                        st.success(f"✅ Resolução completa! Arquivos em: {target_dir}")
+                        st.info("💡 As dependências transitivas (.Runtime, etc) foram baixadas automaticamente.")
                         
                         # Clear session state
                         if "custom_deps_detected" in st.session_state:
